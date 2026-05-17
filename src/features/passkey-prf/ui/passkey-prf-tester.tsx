@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   createPasskeyForAddress,
+  findExistingPasskeyForAddress,
   isWebAuthnSupported,
   normalizeAddress,
   testPasskeyPrf,
@@ -63,6 +64,30 @@ export function PasskeyPrfTester() {
     }
   }
 
+  async function handleFindExisting() {
+    setPendingAction("find");
+    setStatus({ tone: "idle", message: "Opening the browser passkey chooser..." });
+    setLastPrfOutput(null);
+
+    try {
+      const result = await findExistingPasskeyForAddress(cleanAddress);
+
+      saveStoredPasskey(result.passkey);
+      setStorageRevision((revision) => revision + 1);
+      setLastPrfOutput(result.prfFirst);
+      setStatus({
+        tone: "success",
+        message: result.prfFirst
+          ? "Existing passkey selected, saved locally, and PRF output returned."
+          : "Existing passkey selected and saved locally. No PRF output was returned.",
+      });
+    } catch (error) {
+      setStatus({ tone: "error", message: getErrorMessage(error) });
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
   async function handleTestPrf(passkey: StoredPasskey) {
     setPendingAction(passkey.id);
     setStatus({ tone: "idle", message: "Requesting a PRF evaluation from that passkey..." });
@@ -97,8 +122,8 @@ export function PasskeyPrfTester() {
               Passkey PRF tester
             </h1>
             <p className="mt-3 max-w-2xl text-base leading-7 text-zinc-600">
-              Create a passkey scoped to an address, store its credential ID locally, and
-              re-open it to test the WebAuthn PRF extension.
+              Create a discoverable passkey scoped to an address, or select an existing
+              passkey for this domain and save its credential ID locally.
             </p>
           </div>
           <div className="rounded-md border border-zinc-200 bg-zinc-50 px-4 py-3 text-sm text-zinc-700">
@@ -133,8 +158,16 @@ export function PasskeyPrfTester() {
             >
               {pendingAction === "create" ? "Creating..." : "Create passkey"}
             </button>
+            <button
+              type="button"
+              disabled={!supported || !cleanAddress || pendingAction !== null}
+              onClick={handleFindExisting}
+              className="h-11 rounded-md border border-zinc-300 bg-white px-5 text-sm font-semibold text-zinc-900 transition hover:border-emerald-600 hover:text-emerald-800 focus:outline-none focus:ring-4 focus:ring-emerald-100 disabled:cursor-not-allowed disabled:border-zinc-200 disabled:text-zinc-400"
+            >
+              {pendingAction === "find" ? "Finding..." : "Use existing passkey"}
+            </button>
             <p className="text-sm text-zinc-500">
-              Passkeys shown below are the ones this browser has saved for the address.
+              Existing passkeys are selected through the browser chooser for this domain.
             </p>
           </div>
 
