@@ -82,6 +82,8 @@ Passkey authority records are per-user state. Creating one normal Solana account
 
 This matches the product direction: registration should be cheap enough to support early onboarding, while still producing a canonical on-chain record that later instructions can reference.
 
+The 256-user rent comparison is tracked in `docs/passkey-sponsorship-cost-report.md`.
+
 ## Why Split Passkey Proof From Solana Authority
 
 The architecture keeps two roles separate. The passkey P-256 key proves that the passkey participated in registration by signing the challenge checked through the `secp256r1` precompile. The Ed25519 key derived from PRF material acts as a normal Solana transaction authority and signs the transaction.
