@@ -18,6 +18,21 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
+## Solana and MagicBlock Setup
+
+This repo includes an empty Anchor workspace for future programs, plus the MagicBlock local validator configuration copied from Loyal's app repo. No programs have been added yet.
+
+Useful commands:
+
+```bash
+bun run anchor:build
+bun run solana:validator
+bun run magicblock:validator
+bun run anchor:test:localnet
+```
+
+See [docs/solana/localnet-testing.md](./docs/solana/localnet-testing.md) for the three-terminal localnet flow.
+
 ## Learn More
 
 To learn more about Next.js, take a look at the following resources:

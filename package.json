@@ -2,25 +2,43 @@
   "name": "passkey-work",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.11",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "anchor:build": "NO_DNA=1 anchor build",
+    "anchor:test": "NO_DNA=1 anchor test",
+    "anchor:test:localnet": "EPHEMERAL_PROVIDER_ENDPOINT=http://localhost:7799 EPHEMERAL_WS_ENDPOINT=ws://localhost:7800 NO_DNA=1 anchor test --provider.cluster localnet --skip-local-validator --skip-build --skip-deploy",
+    "solana:validator": "NO_DNA=1 mb-test-validator --reset --ledger ~/test-ledger --url devnet --clone-upgradeable-program DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh --clone-upgradeable-program ACLseoPoyC3cBqoUtkbjZ4aDrkurZW86v19pXz2XQnp1",
+    "magicblock:validator": "NO_DNA=1 RUST_LOG=info ephemeral-validator --accounts-lifecycle ephemeral --remote-cluster development --remote-url http://127.0.0.1:8899 --remote-ws-url ws://127.0.0.1:8900 --rpc-port 7799"
   },
   "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/web3.js": "^1.98.0",
     "next": "16.2.6",
     "react": "19.2.4",
     "react-dom": "19.2.4"
   },
   "devDependencies": {
+    "@magicblock-labs/ephemeral-rollups-sdk": "^0.11.1",
+    "@solana/spl-token": "^0.4.13",
     "@tailwindcss/postcss": "^4",
+    "@types/bn.js": "^5.1.0",
+    "@types/chai": "^4.3.0",
+    "@types/mocha": "^9.0.0",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "chai": "^4.3.4",
     "eslint": "^9",
     "eslint-config-next": "16.2.6",
+    "mocha": "^9.0.3",
     "tailwindcss": "^4",
+    "ts-mocha": "^10.0.0",
+    "tweetnacl": "^1.0.3",
     "typescript": "^5"
   },
   "ignoreScripts": [
