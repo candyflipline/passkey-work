@@ -109,25 +109,24 @@ export async function createPasskeyForAddress(address: string) {
 
 export async function findExistingPasskeyForAddress(address: string) {
   const cleanAddress = normalizeAddress(address);
-
-  if (!cleanAddress) {
-    throw new Error("Enter an address before finding an existing passkey.");
-  }
-
   const challenge = crypto.getRandomValues(new Uint8Array(32));
-  const prfSalt = await prfSaltForAddress(cleanAddress);
+  const prfSalt = cleanAddress ? await prfSaltForAddress(cleanAddress) : null;
 
   const assertion = (await navigator.credentials.get({
     publicKey: {
       challenge,
       userVerification: "preferred",
-      extensions: {
-        prf: {
-          eval: {
-            first: prfSalt,
-          },
-        },
-      } as AuthenticationExtensionsClientInputs,
+      ...(prfSalt
+        ? {
+            extensions: ({
+              prf: {
+                eval: {
+                  first: prfSalt,
+                },
+              },
+            } as AuthenticationExtensionsClientInputs),
+          }
+        : {}),
     },
   })) as PublicKeyCredentialWithResponse<AuthenticatorAssertionResponse> | null;
 

@@ -72,14 +72,19 @@ export function PasskeyPrfTester() {
     try {
       const result = await findExistingPasskeyForAddress(cleanAddress);
 
-      saveStoredPasskey(result.passkey);
-      setStorageRevision((revision) => revision + 1);
+      if (cleanAddress) {
+        saveStoredPasskey(result.passkey);
+        setStorageRevision((revision) => revision + 1);
+      }
+
       setLastPrfOutput(result.prfFirst);
       setStatus({
         tone: "success",
-        message: result.prfFirst
-          ? "Existing passkey selected, saved locally, and PRF output returned."
-          : "Existing passkey selected and saved locally. No PRF output was returned.",
+        message: cleanAddress
+          ? result.prfFirst
+            ? "Existing passkey selected, saved locally, and PRF output returned."
+            : "Existing passkey selected and saved locally. No PRF output was returned."
+          : "Existing passkey selected. Enter an address to save it locally or request PRF output.",
       });
     } catch (error) {
       setStatus({ tone: "error", message: getErrorMessage(error) });
@@ -160,7 +165,7 @@ export function PasskeyPrfTester() {
             </button>
             <button
               type="button"
-              disabled={!supported || !cleanAddress || pendingAction !== null}
+              disabled={!supported || pendingAction !== null}
               onClick={handleFindExisting}
               className="h-11 rounded-md border border-zinc-300 bg-white px-5 text-sm font-semibold text-zinc-900 transition hover:border-emerald-600 hover:text-emerald-800 focus:outline-none focus:ring-4 focus:ring-emerald-100 disabled:cursor-not-allowed disabled:border-zinc-200 disabled:text-zinc-400"
             >
