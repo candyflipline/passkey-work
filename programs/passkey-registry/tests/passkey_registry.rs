@@ -1,6 +1,6 @@
 #![cfg(feature = "test-sbf")]
 
-use anchor_lang::{AnchorDeserialize, InstructionData};
+use anchor_lang::{AccountDeserialize, AnchorDeserialize, InstructionData};
 use light_program_test::{
     program_test::LightProgramTest, AddressWithTree, Indexer, ProgramTestConfig, Rpc, RpcError,
 };
@@ -14,7 +14,9 @@ use openssl::{
     nid::Nid,
 };
 use passkey_registry::{
-    build_registration_challenge, compressed_p256_pubkey, PasskeyAuthority, PASSKEY_AUTHORITY_SEED,
+    build_registration_challenge, compressed_p256_pubkey, PasskeyAuthority, PoolAllocator,
+    PASSKEY_AUTHORITY_SEED, POOL_ALLOCATOR_SEED, POOL_ALLOCATOR_STATUS_ACTIVE,
+    POOL_ALLOCATOR_VERSION,
 };
 use solana_sdk::{
     hash::hashv,
@@ -35,6 +37,28 @@ fn lite_svm_can_derive_the_prf_authority_signer() {
     assert_eq!(account.lamports, 1_000_000_000);
 }
 
+#[test]
+fn pool_allocator_uses_all_256_vault_indexes() {
+    let squads_settings = Keypair::new().pubkey();
+    let mut allocator = PoolAllocator {
+        version: POOL_ALLOCATOR_VERSION,
+        status: POOL_ALLOCATOR_STATUS_ACTIVE,
+        squads_settings,
+        next_index: 0,
+        occupied_count: 0,
+        bump: 255,
+    };
+
+    for expected_index in 0..=u8::MAX {
+        assert_eq!(allocator.next_vault_index().unwrap(), expected_index);
+        allocator.allocate_next(expected_index).unwrap();
+    }
+
+    assert_eq!(allocator.next_index, 256);
+    assert_eq!(allocator.occupied_count, 256);
+    assert!(allocator.next_vault_index().is_err());
+}
+
 #[tokio::test]
 async fn creates_passkey_authority_compressed_pda() {
     install_light_cli_shim();
@@ -44,8 +68,16 @@ async fn creates_passkey_authority_compressed_pda() {
     let mut rpc = LightProgramTest::new(config).await.unwrap();
     let payer = rpc.get_payer().insecure_clone();
     let authority = prf_derived_authority();
+    let squads_settings = Keypair::new().pubkey();
+    let (pool_allocator, _) = solana_sdk::pubkey::Pubkey::find_program_address(
+        &[POOL_ALLOCATOR_SEED, squads_settings.as_ref()],
+        &passkey_registry::ID,
+    );
 
     rpc.airdrop_lamports(&authority.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
+    initialize_pool_allocator(&mut rpc, &payer, pool_allocator, squads_settings)
         .await
         .unwrap();
 
@@ -61,12 +93,15 @@ async fn creates_passkey_authority_compressed_pda() {
         &credential_id_hash,
         &authority.pubkey(),
         &address_tree_info.tree,
+        &squads_settings,
+        0,
     );
 
     create_passkey_authority(
         &mut rpc,
         &payer,
         &authority,
+        pool_allocator,
         &address,
         secp256r1_instruction,
         credential_id_hash,
@@ -102,13 +137,42 @@ async fn creates_passkey_authority_compressed_pda() {
         passkey_pubkey_compressed[1..]
     );
     assert_eq!(authority_record.ed25519_authority, authority.pubkey());
+    assert_eq!(authority_record.squads_settings, squads_settings);
+    assert_eq!(authority_record.vault_index, 0);
     assert_eq!(authority_record.nonce, 0);
+
+    let allocator_account = rpc.get_account(pool_allocator).await.unwrap().unwrap();
+    let allocator = PoolAllocator::try_deserialize(&mut allocator_account.data.as_slice()).unwrap();
+    assert_eq!(allocator.squads_settings, squads_settings);
+    assert_eq!(allocator.next_index, 1);
+    assert_eq!(allocator.occupied_count, 1);
+}
+
+async fn initialize_pool_allocator(
+    rpc: &mut LightProgramTest,
+    payer: &Keypair,
+    pool_allocator: solana_sdk::pubkey::Pubkey,
+    squads_settings: solana_sdk::pubkey::Pubkey,
+) -> Result<Signature, RpcError> {
+    let instruction = Instruction {
+        program_id: passkey_registry::ID,
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(pool_allocator, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: passkey_registry::instruction::InitializePoolAllocator { squads_settings }.data(),
+    };
+
+    rpc.create_and_send_transaction(&[instruction], &payer.pubkey(), &[payer])
+        .await
 }
 
 async fn create_passkey_authority(
     rpc: &mut LightProgramTest,
     payer: &Keypair,
     authority: &Keypair,
+    pool_allocator: solana_sdk::pubkey::Pubkey,
     address: &[u8; 32],
     secp256r1_instruction: Instruction,
     credential_id_hash: [u8; 32],
@@ -143,6 +207,7 @@ async fn create_passkey_authority(
         accounts: [
             vec![
                 AccountMeta::new(authority.pubkey(), true),
+                AccountMeta::new(pool_allocator, false),
                 AccountMeta::new_readonly(sysvar::instructions::ID, false),
             ],
             remaining_account_metas,
@@ -172,6 +237,8 @@ fn create_passkey_signature_instruction(
     credential_id_hash: &[u8; 32],
     authority: &solana_sdk::pubkey::Pubkey,
     address_tree: &solana_sdk::pubkey::Pubkey,
+    squads_settings: &solana_sdk::pubkey::Pubkey,
+    vault_index: u8,
 ) -> ([u8; 33], Instruction) {
     let curve = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
     let passkey = EcKey::generate(&curve).unwrap();
@@ -188,6 +255,8 @@ fn create_passkey_signature_instruction(
         &passkey_pubkey_x,
         authority,
         address_tree,
+        squads_settings,
+        vault_index,
     );
     assert_eq!(
         compressed_p256_pubkey(passkey_pubkey_compressed[0], &passkey_pubkey_x).unwrap(),

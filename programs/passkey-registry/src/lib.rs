@@ -2,24 +2,43 @@
 #![allow(deprecated)]
 
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::sysvar::instructions::load_instruction_at_checked;
+use anchor_lang::solana_program::{
+    hash::hashv,
+    instruction::{AccountMeta, Instruction},
+    program::invoke_signed,
+    sysvar::instructions::load_instruction_at_checked,
+};
 use light_sdk::{
     account::LightAccount,
     address::v2::derive_address,
     cpi::{v2::CpiAccounts, CpiSigner},
     derive_light_cpi_signer,
-    instruction::{PackedAddressTreeInfo, ValidityProof},
+    instruction::{account_meta::CompressedAccountMeta, PackedAddressTreeInfo, ValidityProof},
     LightDiscriminator, PackedAddressTreeInfoExt,
 };
 use light_sdk_types::ADDRESS_TREE_V2;
 
 declare_id!("rTvZY3rX9PBXyWzHtMRnY92o7EiEFSwsYZKoCLxUY9X");
 
-pub const PASSKEY_AUTHORITY_VERSION: u8 = 1;
+pub const PASSKEY_AUTHORITY_VERSION: u8 = 2;
 pub const PASSKEY_AUTHORITY_STATUS_ACTIVE: u8 = 1;
 pub const PASSKEY_AUTHORITY_SEED: &[u8] = b"passkey-authority";
+pub const POOL_ALLOCATOR_VERSION: u8 = 1;
+pub const POOL_ALLOCATOR_STATUS_ACTIVE: u8 = 1;
+pub const POOL_ALLOCATOR_SEED: &[u8] = b"pool-allocator";
+pub const VERIFIER_SEED: &[u8] = b"passkey-verifier";
 pub const REGISTRATION_DOMAIN: &[u8] = b"LOYAL_PASSKEY_REGISTER_V1";
+pub const EXECUTION_DOMAIN: &[u8] = b"LOYAL_PASSKEY_EXECUTE_V1";
 pub const SECP256R1_PROGRAM_ID: Pubkey = pubkey!("Secp256r1SigVerify1111111111111111111111111");
+pub const SQUADS_SMART_ACCOUNT_PROGRAM_ID: Pubkey =
+    pubkey!("SMRTzfY6DfH5ik3TKiyLFfXexV8uSG3d2UksSCYdunG");
+pub const SQUADS_SEED_PREFIX: &[u8] = b"smart_account";
+pub const SQUADS_SEED_SMART_ACCOUNT: &[u8] = b"smart_account";
+pub const SQUADS_EXECUTE_TRANSACTION_SYNC_V2_DISCRIMINATOR: [u8; 8] =
+    [90, 81, 187, 81, 39, 70, 128, 78];
+pub const SQUADS_SETTINGS_DISCRIMINATOR: [u8; 8] = [223, 179, 163, 190, 177, 224, 67, 173];
+pub const SQUADS_FULL_PERMISSIONS_MASK: u8 = 7;
+pub const SQUADS_SYNC_SIGNER_COUNT: u8 = 1;
 
 pub const LIGHT_CPI_SIGNER: CpiSigner =
     derive_light_cpi_signer!("rTvZY3rX9PBXyWzHtMRnY92o7EiEFSwsYZKoCLxUY9X");
@@ -58,12 +77,16 @@ pub mod passkey_registry {
         let passkey_pubkey_compressed =
             compressed_p256_pubkey(passkey_pubkey_prefix, &passkey_pubkey_x)?;
 
+        let squads_settings = ctx.accounts.pool_allocator.squads_settings;
+        let vault_index = ctx.accounts.pool_allocator.next_vault_index()?;
         let registration_challenge = build_registration_challenge(
             &credential_id_hash,
             passkey_pubkey_prefix,
             &passkey_pubkey_x,
             &ctx.accounts.authority.key(),
             &address_tree_pubkey,
+            &squads_settings,
+            vault_index,
         );
 
         verify_secp256r1_instruction(
@@ -90,7 +113,11 @@ pub mod passkey_registry {
         authority_record.passkey_pubkey_prefix = passkey_pubkey_prefix;
         authority_record.passkey_pubkey_x = passkey_pubkey_x;
         authority_record.ed25519_authority = ctx.accounts.authority.key();
+        authority_record.squads_settings = squads_settings;
+        authority_record.vault_index = vault_index;
         authority_record.nonce = 0;
+
+        ctx.accounts.pool_allocator.allocate_next(vault_index)?;
 
         LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
             .with_light_account(authority_record)?
@@ -101,15 +128,202 @@ pub mod passkey_registry {
 
         Ok(())
     }
+
+    pub fn initialize_pool_allocator(
+        ctx: Context<InitializePoolAllocator>,
+        squads_settings: Pubkey,
+    ) -> Result<()> {
+        let allocator = &mut ctx.accounts.pool_allocator;
+
+        allocator.version = POOL_ALLOCATOR_VERSION;
+        allocator.status = POOL_ALLOCATOR_STATUS_ACTIVE;
+        allocator.squads_settings = squads_settings;
+        allocator.next_index = 0;
+        allocator.occupied_count = 0;
+        allocator.bump = ctx.bumps.pool_allocator;
+
+        Ok(())
+    }
+
+    pub fn execute_passkey_vault_transaction<'info>(
+        ctx: Context<'_, '_, '_, 'info, ExecutePasskeyVaultTransaction<'info>>,
+        proof: ValidityProof,
+        account_meta: CompressedAccountMeta,
+        light_remaining_accounts_count: u8,
+        secp256r1_instruction_index: u8,
+        expected_nonce: u64,
+        expires_at_unix_timestamp: i64,
+        current_authority: PasskeyAuthority,
+        squads_payload: Vec<u8>,
+    ) -> Result<()> {
+        let (light_remaining_accounts, squads_instruction_accounts) = ctx
+            .remaining_accounts
+            .split_at_checked(usize::from(light_remaining_accounts_count))
+            .ok_or_else(|| error!(PasskeyRegistryError::InvalidRemainingAccountsSplit))?;
+
+        if Clock::get()?.unix_timestamp > expires_at_unix_timestamp {
+            return err!(PasskeyRegistryError::ExpiredExecutionChallenge);
+        }
+
+        validate_current_authority(
+            &current_authority,
+            &account_meta,
+            &ctx.accounts.squads_settings.key(),
+            expected_nonce,
+        )?;
+        validate_squads_pool_settings(
+            ctx.accounts.squads_settings.as_ref(),
+            &ctx.accounts.verifier.key(),
+        )?;
+
+        let passkey_pubkey_compressed = compressed_p256_pubkey(
+            current_authority.passkey_pubkey_prefix,
+            &current_authority.passkey_pubkey_x,
+        )?;
+        let squads_payload_hash = hashv(&[squads_payload.as_slice()]).to_bytes();
+        let squads_accounts_hash = hash_squads_instruction_accounts(squads_instruction_accounts);
+        let execution_challenge = build_execution_challenge(
+            &current_authority.credential_id_hash,
+            current_authority.passkey_pubkey_prefix,
+            &current_authority.passkey_pubkey_x,
+            &current_authority.ed25519_authority,
+            &current_authority.squads_settings,
+            current_authority.vault_index,
+            expected_nonce,
+            expires_at_unix_timestamp,
+            &squads_payload_hash,
+            &squads_accounts_hash,
+        );
+
+        verify_secp256r1_instruction(
+            ctx.accounts.instructions.as_ref(),
+            secp256r1_instruction_index,
+            &passkey_pubkey_compressed,
+            &execution_challenge,
+        )?;
+
+        let account_index = current_authority.vault_index;
+        let mut authority_record = LightAccount::<PasskeyAuthority>::new_mut(
+            &crate::ID,
+            &account_meta,
+            current_authority,
+        )?;
+        authority_record.nonce = authority_record
+            .nonce
+            .checked_add(1)
+            .ok_or_else(|| error!(PasskeyRegistryError::NonceOverflow))?;
+
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.payer.as_ref(),
+            light_remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(authority_record)?
+            .invoke(light_cpi_accounts)?;
+
+        invoke_squads_sync_transaction(
+            &ctx.accounts.squads_settings,
+            &ctx.accounts.squads_program,
+            &ctx.accounts.verifier,
+            squads_instruction_accounts,
+            account_index,
+            squads_payload,
+            ctx.bumps.verifier,
+        )?;
+
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+#[instruction(squads_settings: Pubkey)]
+pub struct InitializePoolAllocator<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        init,
+        payer = payer,
+        space = PoolAllocator::SPACE,
+        seeds = [POOL_ALLOCATOR_SEED, squads_settings.as_ref()],
+        bump
+    )]
+    pub pool_allocator: Account<'info, PoolAllocator>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct CreatePasskeyAuthority<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
+    #[account(
+        mut,
+        constraint = pool_allocator.version == POOL_ALLOCATOR_VERSION,
+        constraint = pool_allocator.status == POOL_ALLOCATOR_STATUS_ACTIVE
+    )]
+    pub pool_allocator: Account<'info, PoolAllocator>,
     /// CHECK: constrained to the instructions sysvar address.
     #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
     pub instructions: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ExecutePasskeyVaultTransaction<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: the compressed authority record stores the expected settings key.
+    #[account(mut)]
+    pub squads_settings: UncheckedAccount<'info>,
+    /// CHECK: constrained to the Squads smart account program id.
+    #[account(address = SQUADS_SMART_ACCOUNT_PROGRAM_ID)]
+    pub squads_program: UncheckedAccount<'info>,
+    /// CHECK: PDA signer used as the sole Squads member.
+    #[account(seeds = [VERIFIER_SEED], bump)]
+    pub verifier: UncheckedAccount<'info>,
+    /// CHECK: constrained to the instructions sysvar address.
+    #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
+    pub instructions: UncheckedAccount<'info>,
+}
+
+#[account]
+#[derive(Debug, Default)]
+pub struct PoolAllocator {
+    pub version: u8,
+    pub status: u8,
+    pub squads_settings: Pubkey,
+    pub next_index: u16,
+    pub occupied_count: u16,
+    pub bump: u8,
+}
+
+impl PoolAllocator {
+    pub const SPACE: usize = 8 + 1 + 1 + 32 + 2 + 2 + 1;
+
+    pub fn next_vault_index(&self) -> Result<u8> {
+        if self.next_index > u16::from(u8::MAX) {
+            return err!(PasskeyRegistryError::PoolExhausted);
+        }
+
+        Ok(self.next_index as u8)
+    }
+
+    pub fn allocate_next(&mut self, expected_index: u8) -> Result<()> {
+        let next_index = self.next_vault_index()?;
+        if next_index != expected_index {
+            return err!(PasskeyRegistryError::AllocatorIndexChanged);
+        }
+
+        self.next_index = self
+            .next_index
+            .checked_add(1)
+            .ok_or_else(|| error!(PasskeyRegistryError::PoolExhausted))?;
+        self.occupied_count = self
+            .occupied_count
+            .checked_add(1)
+            .ok_or_else(|| error!(PasskeyRegistryError::PoolExhausted))?;
+
+        Ok(())
+    }
 }
 
 #[event]
@@ -121,6 +335,8 @@ pub struct PasskeyAuthority {
     pub passkey_pubkey_prefix: u8,
     pub passkey_pubkey_x: [u8; 32],
     pub ed25519_authority: Pubkey,
+    pub squads_settings: Pubkey,
+    pub vault_index: u8,
     pub nonce: u64,
 }
 
@@ -130,9 +346,11 @@ pub fn build_registration_challenge(
     passkey_pubkey_x: &[u8; 32],
     ed25519_authority: &Pubkey,
     address_tree: &Pubkey,
+    squads_settings: &Pubkey,
+    vault_index: u8,
 ) -> Vec<u8> {
     let mut challenge = Vec::with_capacity(
-        REGISTRATION_DOMAIN.len() + 32 + 32 + 32 + 33 + 32 + core::mem::size_of::<u64>(),
+        REGISTRATION_DOMAIN.len() + 32 + 32 + 32 + 33 + 32 + 32 + 1 + core::mem::size_of::<u64>(),
     );
 
     challenge.extend_from_slice(REGISTRATION_DOMAIN);
@@ -142,8 +360,72 @@ pub fn build_registration_challenge(
     challenge.push(passkey_pubkey_prefix);
     challenge.extend_from_slice(passkey_pubkey_x);
     challenge.extend_from_slice(address_tree.as_ref());
+    challenge.extend_from_slice(squads_settings.as_ref());
+    challenge.push(vault_index);
     challenge.extend_from_slice(&0u64.to_le_bytes());
     challenge
+}
+
+pub fn build_execution_challenge(
+    credential_id_hash: &[u8; 32],
+    passkey_pubkey_prefix: u8,
+    passkey_pubkey_x: &[u8; 32],
+    ed25519_authority: &Pubkey,
+    squads_settings: &Pubkey,
+    vault_index: u8,
+    nonce: u64,
+    expires_at_unix_timestamp: i64,
+    squads_payload_hash: &[u8; 32],
+    squads_accounts_hash: &[u8; 32],
+) -> Vec<u8> {
+    let (verifier, _) = derive_verifier_pda();
+    let mut challenge = Vec::with_capacity(
+        EXECUTION_DOMAIN.len()
+            + 32
+            + 32
+            + 32
+            + 32
+            + 32
+            + 33
+            + 32
+            + 1
+            + core::mem::size_of::<u64>()
+            + core::mem::size_of::<i64>()
+            + 32
+            + 32,
+    );
+
+    challenge.extend_from_slice(EXECUTION_DOMAIN);
+    challenge.extend_from_slice(crate::ID.as_ref());
+    challenge.extend_from_slice(SQUADS_SMART_ACCOUNT_PROGRAM_ID.as_ref());
+    challenge.extend_from_slice(verifier.as_ref());
+    challenge.extend_from_slice(ed25519_authority.as_ref());
+    challenge.extend_from_slice(credential_id_hash);
+    challenge.push(passkey_pubkey_prefix);
+    challenge.extend_from_slice(passkey_pubkey_x);
+    challenge.extend_from_slice(squads_settings.as_ref());
+    challenge.push(vault_index);
+    challenge.extend_from_slice(&nonce.to_le_bytes());
+    challenge.extend_from_slice(&expires_at_unix_timestamp.to_le_bytes());
+    challenge.extend_from_slice(squads_payload_hash);
+    challenge.extend_from_slice(squads_accounts_hash);
+    challenge
+}
+
+pub fn derive_verifier_pda() -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[VERIFIER_SEED], &crate::ID)
+}
+
+pub fn derive_squads_vault(squads_settings: &Pubkey, vault_index: u8) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            SQUADS_SEED_PREFIX,
+            squads_settings.as_ref(),
+            SQUADS_SEED_SMART_ACCOUNT,
+            &[vault_index],
+        ],
+        &SQUADS_SMART_ACCOUNT_PROGRAM_ID,
+    )
 }
 
 pub fn compressed_p256_pubkey(prefix: u8, x: &[u8; 32]) -> Result<[u8; 33]> {
@@ -155,6 +437,143 @@ pub fn compressed_p256_pubkey(prefix: u8, x: &[u8; 32]) -> Result<[u8; 33]> {
     pubkey[0] = prefix;
     pubkey[1..].copy_from_slice(x);
     Ok(pubkey)
+}
+
+fn validate_current_authority(
+    authority: &PasskeyAuthority,
+    account_meta: &CompressedAccountMeta,
+    squads_settings: &Pubkey,
+    expected_nonce: u64,
+) -> Result<()> {
+    if authority.version != PASSKEY_AUTHORITY_VERSION
+        || authority.status != PASSKEY_AUTHORITY_STATUS_ACTIVE
+    {
+        return err!(PasskeyRegistryError::InactivePasskeyAuthority);
+    }
+
+    if &authority.squads_settings != squads_settings {
+        return err!(PasskeyRegistryError::InvalidSquadsSettings);
+    }
+
+    if authority.nonce != expected_nonce {
+        return err!(PasskeyRegistryError::InvalidNonce);
+    }
+
+    let address_tree = Pubkey::new_from_array(ADDRESS_TREE_V2);
+    let (expected_address, _) = derive_address(
+        &[
+            PASSKEY_AUTHORITY_SEED,
+            authority.credential_id_hash.as_ref(),
+        ],
+        &address_tree,
+        &crate::ID,
+    );
+
+    if account_meta.address != expected_address {
+        return err!(PasskeyRegistryError::InvalidPasskeyAuthorityAddress);
+    }
+
+    Ok(())
+}
+
+fn validate_squads_pool_settings(
+    settings_account: &AccountInfo<'_>,
+    verifier: &Pubkey,
+) -> Result<()> {
+    if settings_account.owner != &SQUADS_SMART_ACCOUNT_PROGRAM_ID {
+        return err!(PasskeyRegistryError::InvalidSquadsSettings);
+    }
+
+    let data = settings_account.try_borrow_data()?;
+    if data.len() < 8 || data[..8] != SQUADS_SETTINGS_DISCRIMINATOR {
+        return err!(PasskeyRegistryError::InvalidSquadsSettings);
+    }
+
+    let mut body = &data[8..];
+    let settings = SquadsSettingsView::deserialize(&mut body)
+        .map_err(|_| error!(PasskeyRegistryError::InvalidSquadsSettings))?;
+
+    if settings.settings_authority != Pubkey::default()
+        || settings.threshold != 1
+        || settings.time_lock != 0
+        || settings.signers.len() != 1
+    {
+        return err!(PasskeyRegistryError::InvalidSquadsSettings);
+    }
+
+    let signer = &settings.signers[0];
+    if signer.key != *verifier || signer.permissions.mask != SQUADS_FULL_PERMISSIONS_MASK {
+        return err!(PasskeyRegistryError::InvalidSquadsSettings);
+    }
+
+    Ok(())
+}
+
+fn invoke_squads_sync_transaction<'info>(
+    squads_settings: &UncheckedAccount<'info>,
+    squads_program: &UncheckedAccount<'info>,
+    verifier: &UncheckedAccount<'info>,
+    squads_instruction_accounts: &[AccountInfo<'info>],
+    account_index: u8,
+    squads_payload: Vec<u8>,
+    verifier_bump: u8,
+) -> Result<()> {
+    let args = SquadsSyncTransactionArgs {
+        account_index,
+        num_signers: SQUADS_SYNC_SIGNER_COUNT,
+        payload: SquadsSyncPayload::Transaction(squads_payload),
+    };
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&SQUADS_EXECUTE_TRANSACTION_SYNC_V2_DISCRIMINATOR);
+    args.serialize(&mut data)
+        .map_err(|_| error!(PasskeyRegistryError::InvalidSquadsSyncPayload))?;
+
+    let mut accounts = Vec::with_capacity(3 + squads_instruction_accounts.len());
+    accounts.push(AccountMeta::new(squads_settings.key(), false));
+    accounts.push(AccountMeta::new_readonly(squads_program.key(), false));
+    accounts.push(AccountMeta::new_readonly(verifier.key(), true));
+    accounts.extend(
+        squads_instruction_accounts
+            .iter()
+            .map(account_meta_from_info),
+    );
+
+    let instruction = Instruction {
+        program_id: squads_program.key(),
+        accounts,
+        data,
+    };
+
+    let mut account_infos = Vec::with_capacity(3 + squads_instruction_accounts.len());
+    account_infos.push(squads_settings.to_account_info());
+    account_infos.push(squads_program.to_account_info());
+    account_infos.push(verifier.to_account_info());
+    account_infos.extend(squads_instruction_accounts.iter().cloned());
+
+    let verifier_bump_seed = [verifier_bump];
+    let signer_seeds: &[&[u8]] = &[VERIFIER_SEED, &verifier_bump_seed];
+    invoke_signed(&instruction, &account_infos, &[signer_seeds])?;
+
+    Ok(())
+}
+
+fn account_meta_from_info(account: &AccountInfo<'_>) -> AccountMeta {
+    if account.is_writable {
+        AccountMeta::new(account.key(), account.is_signer)
+    } else {
+        AccountMeta::new_readonly(account.key(), account.is_signer)
+    }
+}
+
+fn hash_squads_instruction_accounts(accounts: &[AccountInfo<'_>]) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(accounts.len() * 34);
+    for account in accounts {
+        bytes.extend_from_slice(account.key.as_ref());
+        bytes.push(u8::from(account.is_writable));
+        bytes.push(u8::from(account.is_signer));
+    }
+
+    hashv(&[&bytes]).to_bytes()
 }
 
 fn verify_secp256r1_instruction(
@@ -225,6 +644,46 @@ fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub enum SquadsSyncPayload {
+    Transaction(Vec<u8>),
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct SquadsSyncTransactionArgs {
+    pub account_index: u8,
+    pub num_signers: u8,
+    pub payload: SquadsSyncPayload,
+}
+
+#[derive(AnchorDeserialize)]
+struct SquadsSettingsView {
+    _seed: u128,
+    settings_authority: Pubkey,
+    threshold: u16,
+    time_lock: u32,
+    _transaction_index: u64,
+    _stale_transaction_index: u64,
+    _archival_authority: Option<Pubkey>,
+    _archivable_after: u64,
+    _bump: u8,
+    signers: Vec<SquadsSmartAccountSignerView>,
+    _account_utilization: u8,
+    _policy_seed: Option<u64>,
+    _reserved2: u8,
+}
+
+#[derive(AnchorDeserialize)]
+struct SquadsSmartAccountSignerView {
+    key: Pubkey,
+    permissions: SquadsPermissionsView,
+}
+
+#[derive(AnchorDeserialize)]
+struct SquadsPermissionsView {
+    mask: u8,
+}
+
 #[error_code]
 pub enum PasskeyRegistryError {
     #[msg("The packed Light address tree is not the expected tree")]
@@ -237,4 +696,24 @@ pub enum PasskeyRegistryError {
     InvalidPasskeyPublicKey,
     #[msg("The registration challenge does not match the verified secp256r1 instruction")]
     InvalidRegistrationChallenge,
+    #[msg("The Squads vault pool is exhausted")]
+    PoolExhausted,
+    #[msg("The allocator index changed before the passkey authority could be created")]
+    AllocatorIndexChanged,
+    #[msg("The passkey authority is not active")]
+    InactivePasskeyAuthority,
+    #[msg("The compressed passkey authority address does not match the credential")]
+    InvalidPasskeyAuthorityAddress,
+    #[msg("The passkey authority does not belong to the supplied Squads settings account")]
+    InvalidSquadsSettings,
+    #[msg("The passkey authority nonce does not match the expected nonce")]
+    InvalidNonce,
+    #[msg("The passkey authority nonce overflowed")]
+    NonceOverflow,
+    #[msg("The execution challenge has expired")]
+    ExpiredExecutionChallenge,
+    #[msg("The remaining accounts split does not match the supplied Light account count")]
+    InvalidRemainingAccountsSplit,
+    #[msg("The Squads synchronous transaction payload could not be serialized")]
+    InvalidSquadsSyncPayload,
 }

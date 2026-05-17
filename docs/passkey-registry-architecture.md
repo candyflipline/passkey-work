@@ -1,12 +1,22 @@
 # Passkey Registry Architecture
 
-This project now includes a first Solana program slice for storing passkey authority records in Light Protocol compressed PDAs. The current implementation is intentionally narrow: it proves the on-chain storage and verification path before integrating real browser WebAuthn or application UI flows.
+This project includes a Solana program slice for storing passkey authority records in Light Protocol compressed PDAs and assigning those records to pooled Squads smart-account vault indexes. The implementation is intentionally narrow: it proves cheap on-chain storage, assigns vault indexes, and routes execution through the verifier before integrating real browser WebAuthn or application UI flows.
 
 ## Current Flow
 
-The client starts with two pieces of key material: a passkey P-256 public key and a Solana Ed25519 authority derived from passkey PRF material. It then builds a registration challenge that binds the registry program id, Ed25519 authority, credential id hash, compressed P-256 public key, Light address tree, and initial nonce.
+The client starts with two pieces of key material: a passkey P-256 public key and a Solana Ed25519 authority derived from passkey PRF material. It also targets an existing Squads pool settings account that has the registry verifier PDA as its sole signer.
 
-The passkey signs that challenge with P-256. The transaction includes the Solana `secp256r1` precompile instruction first, then the registry instruction. The Ed25519 authority signs the transaction as the Solana authority. On chain, the program checks that the precompile instruction contains the expected public key and message, then derives and creates the Light compressed PDA for the authority record.
+Before registration, the pool has one tiny normal PDA allocator:
+
+```text
+["pool-allocator", squads_settings]
+```
+
+The allocator stores only version, status, `squads_settings`, `next_index`, `occupied_count`, and bump. It uses monotonic allocation from index `0` through `255`; there is no bitmap or slot reuse in the MVP.
+
+The registration challenge binds the registry program id, Ed25519 authority, credential id hash, compressed P-256 public key, Light address tree, assigned Squads settings account, assigned vault index, and initial nonce.
+
+The passkey signs that challenge with P-256. The transaction includes the Solana `secp256r1` precompile instruction first, then the registry instruction. The Ed25519 authority signs the transaction as the Solana authority. On chain, the program checks that the precompile instruction contains the expected public key and message, verifies the allocator's current index, increments the allocator, then derives and creates the Light compressed PDA for the authority record.
 
 The tested flow currently creates the P-256 keypair and PRF-style Ed25519 keypair inside Rust tests. Browser-created passkeys and browser PRF extension output are deliberately out of scope for this first slice.
 
@@ -14,9 +24,13 @@ The tested flow currently creates the P-256 keypair and PRF-style Ed25519 keypai
 
 The program lives in `programs/passkey-registry`.
 
-`create_passkey_authority` is the initial instruction. It accepts a Light validity proof, packed address tree information, a target output state tree index, a `secp256r1` instruction index, the credential hash, and the compressed P-256 public key split into prefix plus x-coordinate.
+`initialize_pool_allocator` creates the small hot allocator PDA for one Squads settings pool.
 
-The compressed account stores the record version and status, the credential hash, the compressed passkey public key split across `passkey_pubkey_prefix` and `passkey_pubkey_x`, the Ed25519 authority pubkey, and a nonce.
+`create_passkey_authority` registers a user. It accepts a Light validity proof, packed address tree information, a target output state tree index, a `secp256r1` instruction index, the credential hash, and the compressed P-256 public key split into prefix plus x-coordinate. The vault index is not supplied by the client as trusted input; it is read from the allocator and signed in the passkey challenge.
+
+`execute_passkey_vault_transaction` updates the compressed nonce and CPIs into Squads `execute_transaction_sync_v2`. The verifier PDA signs the Squads CPI with program seeds and is expected to be the only Squads signer in the pool settings account. The passkey execution challenge binds the verifier PDA, Squads program id, settings account, vault index, nonce, expiry, payload hash, and remaining account metas hash.
+
+The compressed account stores the record version and status, the credential hash, the compressed passkey public key split across `passkey_pubkey_prefix` and `passkey_pubkey_x`, the Ed25519 authority pubkey, the Squads settings pubkey, the `u8` vault index, and a nonce.
 
 The compressed PDA address is derived from:
 
@@ -25,6 +39,32 @@ The compressed PDA address is derived from:
 ```
 
 plus the expected Light address tree and the passkey registry program id.
+
+The Squads vault PDA is not stored. It is derived when needed from the Squads seeds:
+
+```text
+["smart_account", squads_settings, "smart_account", vault_index]
+```
+
+plus the Squads smart account program id.
+
+## Why Pooled Squads Settings
+
+Creating one Squads settings account per passkey user would bring back the per-user sponsorship cost this design is trying to avoid. Instead, one static Squads settings account is amortized across the full `u8` vault index space.
+
+The intended Squads settings configuration is:
+
+```text
+threshold = 1
+time_lock = 0
+signer = registry verifier PDA with Initiate + Vote + Execute
+```
+
+The passkey user is not added as a Squads signer, and the registry does not update Squads settings during user registration. The registry allocator owns vault assignment. Squads `account_utilization` remains outside this flow.
+
+The execution path rechecks the supplied Squads settings account before CPI: it must be owned by the Squads program, have `settings_authority = Pubkey::default()`, `threshold = 1`, `time_lock = 0`, and exactly one signer, the registry verifier PDA with full permissions.
+
+The program uses all 256 possible vault indexes unless a future product decision explicitly reserves one.
 
 ## Why Light Protocol Compressed PDAs
 
@@ -52,11 +92,19 @@ Light compressed PDA derivation includes the address tree. The program checks th
 
 That prevents the client and program from silently deriving different compressed addresses or accepting a record under an unexpected tree.
 
+## Token Account Sponsorship
+
+The registry derives vaults but does not pre-create token accounts or ATAs for those vaults. Token accounts should be created lazily only when a user actually needs a specific mint; otherwise token account rent becomes a hidden per-user sponsorship cost.
+
+## Replay State Tradeoff
+
+The MVP keeps the replay nonce inside `PasskeyAuthority`. That minimizes account count and keeps onboarding to one compressed record per user. The tradeoff is that every execution touches compressed state and therefore pays the Light proof and state-tree costs. If some users become high frequency, replay protection can later move to a small hot nonce PDA or compressed nullifier path without changing the pooled Squads assignment model.
+
 ## Testing Strategy
 
 The first test layer uses LiteSVM to confirm the PRF-derived Ed25519 authority behaves like a normal Solana signer/account target.
 
-The integration test uses `light-program-test` with SBF bytecode. It starts the Light test environment and prover, creates an in-test P-256 passkey keypair, builds and signs the registration challenge, airdrops lamports to the Ed25519 authority, submits the `secp256r1` precompile instruction plus registry instruction, creates the compressed PDA, fetches the compressed account back, and verifies the stored fields.
+The integration test uses `light-program-test` with SBF bytecode. It starts the Light test environment and prover, initializes a pool allocator, creates an in-test P-256 passkey keypair, builds and signs the registration challenge for allocator index `0`, airdrops lamports to the Ed25519 authority, submits the `secp256r1` precompile instruction plus registry instruction, creates the compressed PDA, fetches the compressed account back, and verifies the stored fields and allocator increment.
 
 Run it with:
 
@@ -68,6 +116,8 @@ The SBF test path is the main correctness gate because it compiles the program t
 
 ## Current Boundaries
 
-Implemented and tested today: Light compressed PDA creation for passkey authority records, P-256 challenge verification through the Solana `secp256r1` precompile instruction, PRF-style Ed25519 transaction signing, and Light validity proof packing through `light-program-test`.
+Implemented and tested today: allocator initialization, monotonic vault assignment, Light compressed PDA creation for passkey authority records, P-256 challenge verification through the Solana `secp256r1` precompile instruction, PRF-style Ed25519 transaction signing, and Light validity proof packing through `light-program-test`.
 
-Still out of scope: browser WebAuthn ceremony integration, browser PRF extension integration, client-side hardening for real PRF material, update/revoke/rotate/close instructions, and application UI or API routes for registration.
+Implemented but not yet covered by an end-to-end Squads test: the verifier instruction path that updates the compressed nonce and CPIs into Squads synchronous execution.
+
+Still out of scope: browser WebAuthn ceremony integration, browser PRF extension integration, client-side hardening for real PRF material, Squads pool provisioning, exact Squads settings rent measurement on the target deployment, update/revoke/rotate/close instructions, slot reuse/bitmap allocation, high-frequency hot nonce promotion, and application UI or API routes for registration.
