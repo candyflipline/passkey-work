@@ -53,6 +53,17 @@ Examples of code that may belong in `src/lib/` after reuse is proven:
 - Shared validation or serialization helpers
 - Stable integration wrappers used by multiple features
 
+## Light Protocol and Compressed PDAs
+
+This repo is preparing to build Solana programs that use Light Protocol compressed PDAs. Treat Light docs as live protocol/tooling docs; start from `https://www.zkcompression.com/llms.txt`, then read the compressed PDA overview and guide before implementing.
+
+Keep this context in mind:
+
+- Compressed PDA addresses include the address tree in derivation, so programs and clients must agree on and verify the expected tree.
+- Client flows use `@lightprotocol/stateless.js` to derive or fetch compressed addresses, request validity proofs, pack Light accounts, and pass them through `remainingAccounts`.
+- Use `bun run light:validator` for local compressed-account testing, and the `zkcompression` MCP server or installed Light skills when current Light-specific context is needed.
+- Add on-chain Rust dependencies only when adding the first compressed PDA program, and confirm current Light/Anchor/Solana compatibility before pinning versions.
+
 ## Git and Pull Requests
 
 Use the same commit and PR conventions as Loyal's main repositories.

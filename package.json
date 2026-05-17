@@ -12,17 +12,21 @@
     "anchor:build": "NO_DNA=1 anchor build",
     "anchor:test": "NO_DNA=1 anchor test",
     "anchor:test:localnet": "EPHEMERAL_PROVIDER_ENDPOINT=http://localhost:7799 EPHEMERAL_WS_ENDPOINT=ws://localhost:7800 NO_DNA=1 anchor test --provider.cluster localnet --skip-local-validator --skip-build --skip-deploy",
+    "light:validator": "light test-validator",
     "solana:validator": "NO_DNA=1 mb-test-validator --reset --ledger ~/test-ledger --url devnet --clone-upgradeable-program DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh --clone-upgradeable-program ACLseoPoyC3cBqoUtkbjZ4aDrkurZW86v19pXz2XQnp1",
     "magicblock:validator": "NO_DNA=1 RUST_LOG=info ephemeral-validator --accounts-lifecycle ephemeral --remote-cluster development --remote-url http://127.0.0.1:8899 --remote-ws-url ws://127.0.0.1:8900 --rpc-port 7799"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",
+    "@lightprotocol/compressed-token": "^0.23.3",
+    "@lightprotocol/stateless.js": "^0.23.3",
     "@solana/web3.js": "^1.98.0",
     "next": "16.2.6",
     "react": "19.2.4",
     "react-dom": "19.2.4"
   },
   "devDependencies": {
+    "@lightprotocol/zk-compression-cli": "^0.28.4",
     "@magicblock-labs/ephemeral-rollups-sdk": "^0.11.1",
     "@solana/spl-token": "^0.4.13",
     "@tailwindcss/postcss": "^4",
