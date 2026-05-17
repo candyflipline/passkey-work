@@ -11,6 +11,7 @@
     "lint": "eslint",
     "anchor:build": "NO_DNA=1 anchor build",
     "anchor:test": "NO_DNA=1 anchor test",
+    "test:sbf": "NO_DNA=1 cargo test-sbf -p passkey-registry --features test-sbf",
     "anchor:test:localnet": "EPHEMERAL_PROVIDER_ENDPOINT=http://localhost:7799 EPHEMERAL_WS_ENDPOINT=ws://localhost:7800 NO_DNA=1 anchor test --provider.cluster localnet --skip-local-validator --skip-build --skip-deploy",
     "light:validator": "light test-validator",
     "solana:validator": "NO_DNA=1 mb-test-validator --reset --ledger ~/test-ledger --url devnet --clone-upgradeable-program DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh --clone-upgradeable-program ACLseoPoyC3cBqoUtkbjZ4aDrkurZW86v19pXz2XQnp1",
