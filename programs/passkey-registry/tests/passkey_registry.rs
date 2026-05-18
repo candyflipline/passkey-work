@@ -1165,7 +1165,7 @@ async fn create_passkey_authority(
     authority: &Keypair,
     pool_allocator: solana_sdk::pubkey::Pubkey,
     address: &[u8; 32],
-    secp256r1_instruction: Instruction,
+    assertion: TestWebAuthnAssertion,
     credential_id_hash: [u8; 32],
     passkey_pubkey_compressed: [u8; 33],
 ) -> Result<Signature, RpcError> {
@@ -1175,7 +1175,7 @@ async fn create_passkey_authority(
         authority,
         pool_allocator,
         address,
-        secp256r1_instruction,
+        assertion,
         credential_id_hash,
         passkey_pubkey_compressed,
         0,
@@ -1190,7 +1190,7 @@ async fn create_passkey_authority_with_instruction_order(
     authority: &Keypair,
     pool_allocator: solana_sdk::pubkey::Pubkey,
     address: &[u8; 32],
-    secp256r1_instruction: Instruction,
+    assertion: TestWebAuthnAssertion,
     credential_id_hash: [u8; 32],
     passkey_pubkey_compressed: [u8; 33],
     secp256r1_instruction_index: u8,
@@ -1239,14 +1239,16 @@ async fn create_passkey_authority_with_instruction_order(
             credential_id_hash,
             passkey_pubkey_prefix: passkey_pubkey_compressed[0],
             passkey_pubkey_x,
+            authenticator_data: assertion.authenticator_data.clone(),
+            client_data_json: assertion.client_data_json.clone(),
         }
         .data(),
     };
 
     let instructions = if secp256r1_first {
-        vec![secp256r1_instruction, create_instruction]
+        vec![assertion.instruction, create_instruction]
     } else {
-        vec![create_instruction, secp256r1_instruction]
+        vec![create_instruction, assertion.instruction]
     };
 
     rpc.create_and_send_transaction(&instructions, &payer.pubkey(), &[payer, authority])
@@ -1259,7 +1261,7 @@ fn create_passkey_signature_instruction(
     address_tree: &solana_sdk::pubkey::Pubkey,
     squads_settings: &solana_sdk::pubkey::Pubkey,
     vault_index: u8,
-) -> ([u8; 33], Instruction) {
+) -> ([u8; 33], TestWebAuthnAssertion) {
     let passkey = TestPasskey::new();
     let instruction = passkey.registration_instruction(
         credential_id_hash,
@@ -1420,7 +1422,7 @@ async fn execute_passkey_vault_transfer(
         &squads_payload_hash,
         &squads_accounts_hash,
     );
-    let secp256r1_instruction = passkey.signature_instruction(&execution_challenge);
+    let assertion = passkey.signature_instruction(&execution_challenge);
 
     let mut remaining_accounts = PackedAccounts::default();
     remaining_accounts
@@ -1464,12 +1466,14 @@ async fn execute_passkey_vault_transfer(
             expires_at_unix_timestamp,
             current_authority,
             squads_payload,
+            authenticator_data: assertion.authenticator_data,
+            client_data_json: assertion.client_data_json,
         }
         .data(),
     };
 
     rpc.create_and_send_transaction(
-        &[secp256r1_instruction, execute_instruction],
+        &[assertion.instruction, execute_instruction],
         &payer.pubkey(),
         &[payer],
     )
@@ -1506,6 +1510,12 @@ struct TestPasskey {
     private_key_der: Vec<u8>,
 }
 
+struct TestWebAuthnAssertion {
+    instruction: Instruction,
+    authenticator_data: Vec<u8>,
+    client_data_json: Vec<u8>,
+}
+
 impl TestPasskey {
     fn new() -> Self {
         let curve = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
@@ -1529,7 +1539,7 @@ impl TestPasskey {
         address_tree: &Pubkey,
         squads_settings: &Pubkey,
         vault_index: u8,
-    ) -> Instruction {
+    ) -> TestWebAuthnAssertion {
         let passkey_pubkey_x: [u8; 32] = self.compressed_pubkey[1..].try_into().unwrap();
         let challenge = build_registration_challenge(
             credential_id_hash,
@@ -1547,15 +1557,75 @@ impl TestPasskey {
         self.signature_instruction(&challenge)
     }
 
-    fn signature_instruction(&self, challenge: &[u8]) -> Instruction {
+    fn signature_instruction(&self, challenge: &[u8]) -> TestWebAuthnAssertion {
+        let authenticator_data = test_authenticator_data();
+        let client_data_json = test_client_data_json(challenge);
+        let client_data_hash = hashv(&[client_data_json.as_slice()]).to_bytes();
+        let mut signed_message = Vec::with_capacity(authenticator_data.len() + 32);
+        signed_message.extend_from_slice(&authenticator_data);
+        signed_message.extend_from_slice(&client_data_hash);
         let signature =
-            solana_secp256r1_program::sign_message(challenge, &self.private_key_der).unwrap();
-        solana_secp256r1_program::new_secp256r1_instruction_with_signature(
-            challenge,
+            solana_secp256r1_program::sign_message(&signed_message, &self.private_key_der).unwrap();
+        let instruction = solana_secp256r1_program::new_secp256r1_instruction_with_signature(
+            &signed_message,
             &signature,
             &self.compressed_pubkey,
-        )
+        );
+
+        TestWebAuthnAssertion {
+            instruction,
+            authenticator_data,
+            client_data_json,
+        }
     }
+}
+
+fn test_authenticator_data() -> Vec<u8> {
+    let mut data = vec![0u8; 37];
+    data[32] = 0x05;
+    data
+}
+
+fn test_client_data_json(challenge: &[u8]) -> Vec<u8> {
+    format!(
+        r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://passkey-work.test"}}"#,
+        base64url_encode(challenge)
+    )
+    .into_bytes()
+}
+
+fn base64url_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::with_capacity((input.len() * 4).div_ceil(3));
+    let mut index = 0;
+
+    while index + 3 <= input.len() {
+        let chunk = ((input[index] as u32) << 16)
+            | ((input[index + 1] as u32) << 8)
+            | input[index + 2] as u32;
+        output.push(TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+        output.push(TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+        output.push(TABLE[((chunk >> 6) & 0x3f) as usize] as char);
+        output.push(TABLE[(chunk & 0x3f) as usize] as char);
+        index += 3;
+    }
+
+    match input.len() - index {
+        1 => {
+            let chunk = (input[index] as u32) << 16;
+            output.push(TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+            output.push(TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+        }
+        2 => {
+            let chunk = ((input[index] as u32) << 16) | ((input[index + 1] as u32) << 8);
+            output.push(TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+            output.push(TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+            output.push(TABLE[((chunk >> 6) & 0x3f) as usize] as char);
+        }
+        _ => {}
+    }
+
+    output
 }
 
 fn serialize_squads_create_smart_account_args(

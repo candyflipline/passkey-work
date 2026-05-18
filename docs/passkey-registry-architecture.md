@@ -36,7 +36,7 @@ When an allocator reaches `next_index = 256`, the current Squads settings pool i
 
 The outer fee payer still submits the transaction and pays transaction fees. The allocator SOL sponsors account creation rent and top-ups inside the instruction.
 
-The tested flow currently creates the P-256 keypair and PRF-style Ed25519 keypair inside Rust tests. Browser-created passkeys and browser PRF extension output are deliberately out of scope for this first slice.
+The SBF tests still use an in-test P-256 keypair and PRF-style Ed25519 keypair, but the verifier now checks the same signed message shape that browser WebAuthn assertions produce: `authenticatorData || sha256(clientDataJSON)`. Browser SDK helpers for this flow live in `src/features/passkey-smart-account` and are summarized in `docs/passkey-browser-sdk.md`.
 
 The end-to-end Squads test creates the Squads settings account locally with the registry verifier PDA as the only signer, initializes the registry allocator against that settings account, creates the compressed passkey authority record, funds vault index `0`, and then uses a passkey-signed execution challenge to move SOL back out of that vault through Squads synchronous execution.
 
@@ -170,6 +170,6 @@ The SBF test path is the main correctness gate because it compiles the registry 
 
 ## Current Boundaries
 
-Implemented and tested today: Light-PDA allocator initialization, allocator funding and admin-gated surplus withdrawal, compressed pool-directory initialization and rollover, allocator-funded Squads settings creation, monotonic vault assignment, Light compressed PDA creation for passkey authority records, P-256 challenge verification through the Solana `secp256r1` precompile instruction, PRF-style Ed25519 transaction signing, Light validity proof packing through `light-program-test`, Squads settings creation with the verifier PDA as signer, and passkey-authorized Squads sync execution from vault index `0`.
+Implemented and tested today: Light-PDA allocator initialization, allocator funding and admin-gated surplus withdrawal, compressed pool-directory initialization and rollover, allocator-funded Squads settings creation, monotonic vault assignment, Light compressed PDA creation for passkey authority records, browser-compatible WebAuthn/P-256 challenge verification through the Solana `secp256r1` precompile instruction, PRF-style Ed25519 transaction signing, Light validity proof packing through `light-program-test`, Squads settings creation with the verifier PDA as signer, passkey-authorized Squads sync execution from vault index `0`, and a browser-side TypeScript SDK surface for passkey creation, PRF authority derivation, address derivation, instruction packing, and user-paid or sponsored transaction assembly.
 
-Still out of scope: browser WebAuthn ceremony integration, browser PRF extension integration, client-side hardening for real PRF material, production Squads pool provisioning, exact Squads settings rent measurement on the target deployment, update/revoke/rotate/close instructions, slot reuse/bitmap allocation, high-frequency hot nonce promotion, and application UI or API routes for registration.
+Still out of scope: production Squads pool provisioning, exact Squads settings rent measurement on the target deployment, update/revoke/rotate/close instructions, slot reuse/bitmap allocation, high-frequency hot nonce promotion, and application UI or API routes for registration.

@@ -8,6 +8,7 @@
         "@lightprotocol/compressed-token": "^0.23.3",
         "@lightprotocol/stateless.js": "^0.23.3",
         "@solana/web3.js": "^1.98.0",
+        "bn.js": "^5.2.1",
         "next": "16.2.6",
         "react": "19.2.4",
         "react-dom": "19.2.4",

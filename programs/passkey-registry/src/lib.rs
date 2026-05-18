@@ -47,6 +47,9 @@ pub const SQUADS_SYNC_SIGNER_COUNT: u8 = 1;
 pub const SQUADS_SEED_SETTINGS: &[u8] = b"settings";
 pub const SQUADS_PROGRAM_CONFIG_SEED: &[u8] = b"program_config";
 pub const SQUADS_ONE_SIGNER_SETTINGS_SPACE: usize = 168;
+pub const WEBAUTHN_GET_TYPE: &[u8] = b"webauthn.get";
+pub const WEBAUTHN_MAX_AUTHENTICATOR_DATA_LEN: usize = 512;
+pub const WEBAUTHN_MAX_CLIENT_DATA_JSON_LEN: usize = 2048;
 
 // Light checks this program-authority PDA during CPI.
 pub const LIGHT_CPI_SIGNER: CpiSigner =
@@ -69,6 +72,8 @@ pub mod passkey_registry {
         credential_id_hash: [u8; 32],
         passkey_pubkey_prefix: u8,
         passkey_pubkey_x: [u8; 32],
+        authenticator_data: Vec<u8>,
+        client_data_json: Vec<u8>,
     ) -> Result<()> {
         let light_cpi_accounts = CpiAccounts::new(
             ctx.accounts.authority.as_ref(),
@@ -100,11 +105,13 @@ pub mod passkey_registry {
             vault_index,
         );
 
-        verify_secp256r1_instruction(
+        verify_webauthn_secp256r1_instruction(
             ctx.accounts.instructions.as_ref(),
             secp256r1_instruction_index,
             &passkey_pubkey_compressed,
             &registration_challenge,
+            &authenticator_data,
+            &client_data_json,
         )?;
 
         let (address, address_seed) = derive_address(
@@ -345,6 +352,8 @@ pub mod passkey_registry {
         expires_at_unix_timestamp: i64,
         current_authority: PasskeyAuthority,
         squads_payload: Vec<u8>,
+        authenticator_data: Vec<u8>,
+        client_data_json: Vec<u8>,
     ) -> Result<()> {
         // Light proof accounts come first; the rest are forwarded to Squads unchanged.
         let (light_remaining_accounts, squads_instruction_accounts) = ctx
@@ -387,11 +396,13 @@ pub mod passkey_registry {
             &squads_accounts_hash,
         );
 
-        verify_secp256r1_instruction(
+        verify_webauthn_secp256r1_instruction(
             ctx.accounts.instructions.as_ref(),
             secp256r1_instruction_index,
             &passkey_pubkey_compressed,
             &execution_challenge,
+            &authenticator_data,
+            &client_data_json,
         )?;
 
         let account_index = current_authority.vault_index;
@@ -1140,6 +1151,141 @@ fn verify_secp256r1_instruction(
     Ok(())
 }
 
+fn verify_webauthn_secp256r1_instruction(
+    instructions: &AccountInfo<'_>,
+    instruction_index: u8,
+    expected_pubkey: &[u8; 33],
+    expected_challenge: &[u8],
+    authenticator_data: &[u8],
+    client_data_json: &[u8],
+) -> Result<()> {
+    validate_webauthn_authenticator_data(authenticator_data)?;
+    validate_webauthn_client_data_json(client_data_json, expected_challenge)?;
+
+    let client_data_hash = hashv(&[client_data_json]).to_bytes();
+    let mut signed_message = Vec::with_capacity(authenticator_data.len() + client_data_hash.len());
+    signed_message.extend_from_slice(authenticator_data);
+    signed_message.extend_from_slice(&client_data_hash);
+
+    verify_secp256r1_instruction(
+        instructions,
+        instruction_index,
+        expected_pubkey,
+        &signed_message,
+    )
+}
+
+fn validate_webauthn_authenticator_data(authenticator_data: &[u8]) -> Result<()> {
+    if authenticator_data.len() < 33
+        || authenticator_data.len() > WEBAUTHN_MAX_AUTHENTICATOR_DATA_LEN
+    {
+        return err!(PasskeyRegistryError::InvalidWebAuthnAuthenticatorData);
+    }
+
+    let flags = authenticator_data[32];
+    let user_present = flags & 0x01 != 0;
+    let user_verified = flags & 0x04 != 0;
+    if !user_present || !user_verified {
+        return err!(PasskeyRegistryError::InvalidWebAuthnAuthenticatorData);
+    }
+
+    Ok(())
+}
+
+fn validate_webauthn_client_data_json(
+    client_data_json: &[u8],
+    expected_challenge: &[u8],
+) -> Result<()> {
+    if client_data_json.is_empty() || client_data_json.len() > WEBAUTHN_MAX_CLIENT_DATA_JSON_LEN {
+        return err!(PasskeyRegistryError::InvalidWebAuthnClientDataJson);
+    }
+
+    let expected_challenge_base64url = base64url_encode(expected_challenge);
+    let challenge = json_string_field(client_data_json, b"challenge")?;
+    let credential_type = json_string_field(client_data_json, b"type")?;
+
+    if challenge != expected_challenge_base64url.as_bytes() || credential_type != WEBAUTHN_GET_TYPE
+    {
+        return err!(PasskeyRegistryError::InvalidWebAuthnClientDataJson);
+    }
+
+    Ok(())
+}
+
+fn json_string_field<'a>(json: &'a [u8], field: &[u8]) -> Result<&'a [u8]> {
+    let mut key = Vec::with_capacity(field.len() + 2);
+    key.push(b'"');
+    key.extend_from_slice(field);
+    key.push(b'"');
+
+    let key_start = json
+        .windows(key.len())
+        .position(|window| window == key.as_slice())
+        .ok_or_else(|| error!(PasskeyRegistryError::InvalidWebAuthnClientDataJson))?;
+    let mut cursor = key_start + key.len();
+
+    while cursor < json.len() && json[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if cursor >= json.len() || json[cursor] != b':' {
+        return err!(PasskeyRegistryError::InvalidWebAuthnClientDataJson);
+    }
+    cursor += 1;
+
+    while cursor < json.len() && json[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if cursor >= json.len() || json[cursor] != b'"' {
+        return err!(PasskeyRegistryError::InvalidWebAuthnClientDataJson);
+    }
+    cursor += 1;
+    let value_start = cursor;
+
+    while cursor < json.len() {
+        match json[cursor] {
+            b'"' => return Ok(&json[value_start..cursor]),
+            b'\\' => return err!(PasskeyRegistryError::InvalidWebAuthnClientDataJson),
+            _ => cursor += 1,
+        }
+    }
+
+    err!(PasskeyRegistryError::InvalidWebAuthnClientDataJson)
+}
+
+fn base64url_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::with_capacity((input.len() * 4).div_ceil(3));
+    let mut index = 0;
+
+    while index + 3 <= input.len() {
+        let chunk = ((input[index] as u32) << 16)
+            | ((input[index + 1] as u32) << 8)
+            | input[index + 2] as u32;
+        output.push(TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+        output.push(TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+        output.push(TABLE[((chunk >> 6) & 0x3f) as usize] as char);
+        output.push(TABLE[(chunk & 0x3f) as usize] as char);
+        index += 3;
+    }
+
+    match input.len() - index {
+        1 => {
+            let chunk = (input[index] as u32) << 16;
+            output.push(TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+            output.push(TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+        }
+        2 => {
+            let chunk = ((input[index] as u32) << 16) | ((input[index + 1] as u32) << 8);
+            output.push(TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+            output.push(TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+            output.push(TABLE[((chunk >> 6) & 0x3f) as usize] as char);
+        }
+        _ => {}
+    }
+
+    output
+}
+
 fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
     let bytes = data
         .get(offset..offset + 2)
@@ -1269,4 +1415,8 @@ pub enum PasskeyRegistryError {
     InsufficientPoolAllocatorLamports,
     #[msg("The secp256r1 verification instruction must precede the registry instruction")]
     Secp256r1InstructionMustPrecedeRegistry,
+    #[msg("Invalid WebAuthn authenticator data")]
+    InvalidWebAuthnAuthenticatorData,
+    #[msg("Invalid WebAuthn client data JSON")]
+    InvalidWebAuthnClientDataJson,
 }
