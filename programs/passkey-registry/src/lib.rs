@@ -26,6 +26,9 @@ pub const PASSKEY_AUTHORITY_SEED: &[u8] = b"passkey-authority";
 pub const POOL_ALLOCATOR_VERSION: u8 = 1;
 pub const POOL_ALLOCATOR_STATUS_ACTIVE: u8 = 1;
 pub const POOL_ALLOCATOR_SEED: &[u8] = b"pool-allocator";
+pub const POOL_DIRECTORY_VERSION: u8 = 1;
+pub const POOL_DIRECTORY_STATUS_ACTIVE: u8 = 1;
+pub const POOL_DIRECTORY_SEED: &[u8] = b"pool-directory";
 pub const VERIFIER_SEED: &[u8] = b"passkey-verifier";
 pub const REGISTRATION_DOMAIN: &[u8] = b"LOYAL_PASSKEY_REGISTER_V1";
 pub const EXECUTION_DOMAIN: &[u8] = b"LOYAL_PASSKEY_EXECUTE_V1";
@@ -39,7 +42,9 @@ pub const SQUADS_EXECUTE_TRANSACTION_SYNC_V2_DISCRIMINATOR: [u8; 8] =
 pub const SQUADS_SETTINGS_DISCRIMINATOR: [u8; 8] = [223, 179, 163, 190, 177, 224, 67, 173];
 pub const SQUADS_FULL_PERMISSIONS_MASK: u8 = 7;
 pub const SQUADS_SYNC_SIGNER_COUNT: u8 = 1;
+pub const SQUADS_SEED_SETTINGS: &[u8] = b"settings";
 
+// Light checks this program-authority PDA during CPI.
 pub const LIGHT_CPI_SIGNER: CpiSigner =
     derive_light_cpi_signer!("rTvZY3rX9PBXyWzHtMRnY92o7EiEFSwsYZKoCLxUY9X");
 
@@ -77,6 +82,7 @@ pub mod passkey_registry {
         let passkey_pubkey_compressed =
             compressed_p256_pubkey(passkey_pubkey_prefix, &passkey_pubkey_x)?;
 
+        // The allocator is the canonical source for the signed vault index.
         let squads_settings = ctx.accounts.pool_allocator.squads_settings;
         let vault_index = ctx.accounts.pool_allocator.next_vault_index()?;
         let registration_challenge = build_registration_challenge(
@@ -117,6 +123,7 @@ pub mod passkey_registry {
         authority_record.vault_index = vault_index;
         authority_record.nonce = 0;
 
+        // CPI atomicity.
         ctx.accounts.pool_allocator.allocate_next(vault_index)?;
 
         LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
@@ -144,6 +151,107 @@ pub mod passkey_registry {
         Ok(())
     }
 
+    pub fn initialize_pool_directory<'info>(
+        ctx: Context<'_, '_, '_, 'info, InitializePoolDirectory<'info>>,
+        proof: ValidityProof,
+        address_tree_info: PackedAddressTreeInfo,
+        output_state_tree_index: u8,
+        active_pool_index: u128,
+    ) -> Result<()> {
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.payer.as_ref(),
+            ctx.remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+        let address_tree_pubkey = address_tree_info
+            .get_tree_pubkey(&light_cpi_accounts)
+            .map_err(|_| error!(PasskeyRegistryError::InvalidAddressTree))?;
+
+        if address_tree_pubkey.to_bytes() != ADDRESS_TREE_V2 {
+            return err!(PasskeyRegistryError::InvalidAddressTree);
+        }
+
+        // Clients read the directory off chain before choosing the allocator.
+        validate_active_pool_accounts(
+            &ctx.accounts.pool_allocator,
+            &ctx.accounts.squads_settings,
+            active_pool_index,
+        )?;
+
+        let (address, address_seed) =
+            derive_address(&[POOL_DIRECTORY_SEED], &address_tree_pubkey, &crate::ID);
+        let mut pool_directory = LightAccount::<PoolDirectory>::new_init(
+            &crate::ID,
+            Some(address),
+            output_state_tree_index,
+        );
+        pool_directory.version = POOL_DIRECTORY_VERSION;
+        pool_directory.status = POOL_DIRECTORY_STATUS_ACTIVE;
+        pool_directory.active_pool_index = active_pool_index;
+
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(pool_directory)?
+            .with_new_addresses(&[
+                address_tree_info.into_new_address_params_assigned_packed(address_seed, Some(0))
+            ])
+            .invoke(light_cpi_accounts)?;
+
+        Ok(())
+    }
+
+    pub fn advance_pool_directory<'info>(
+        ctx: Context<'_, '_, '_, 'info, AdvancePoolDirectory<'info>>,
+        proof: ValidityProof,
+        account_meta: CompressedAccountMeta,
+        expected_active_pool_index: u128,
+        current_directory: PoolDirectory,
+    ) -> Result<()> {
+        // Rollover waits for all 256 vault indexes, so prepaid Squads capacity is never stranded.
+        validate_current_pool_directory(
+            &current_directory,
+            &account_meta,
+            expected_active_pool_index,
+        )?;
+
+        validate_exhausted_pool_allocator(
+            &ctx.accounts.current_pool_allocator,
+            current_directory.active_pool_index,
+        )?;
+
+        let next_pool_index = current_directory
+            .active_pool_index
+            .checked_add(1)
+            .ok_or_else(|| error!(PasskeyRegistryError::PoolIndexOverflow))?;
+        let (expected_next_settings, _) = derive_squads_settings(next_pool_index);
+        if ctx.accounts.new_squads_settings.key() != expected_next_settings {
+            return err!(PasskeyRegistryError::InvalidSquadsSettings);
+        }
+
+        let (verifier, _) = derive_verifier_pda();
+        validate_squads_pool_settings(ctx.accounts.new_squads_settings.as_ref(), &verifier)?;
+
+        let new_allocator = &mut ctx.accounts.new_pool_allocator;
+        new_allocator.version = POOL_ALLOCATOR_VERSION;
+        new_allocator.status = POOL_ALLOCATOR_STATUS_ACTIVE;
+        new_allocator.squads_settings = ctx.accounts.new_squads_settings.key();
+        new_allocator.next_index = 0;
+
+        let mut pool_directory =
+            LightAccount::<PoolDirectory>::new_mut(&crate::ID, &account_meta, current_directory)?;
+        pool_directory.active_pool_index = next_pool_index;
+
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.payer.as_ref(),
+            ctx.remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(pool_directory)?
+            .invoke(light_cpi_accounts)?;
+
+        Ok(())
+    }
+
     pub fn execute_passkey_vault_transaction<'info>(
         ctx: Context<'_, '_, '_, 'info, ExecutePasskeyVaultTransaction<'info>>,
         proof: ValidityProof,
@@ -155,6 +263,7 @@ pub mod passkey_registry {
         current_authority: PasskeyAuthority,
         squads_payload: Vec<u8>,
     ) -> Result<()> {
+        // Light proof accounts come first; the rest are forwarded to Squads unchanged.
         let (light_remaining_accounts, squads_instruction_accounts) = ctx
             .remaining_accounts
             .split_at_checked(usize::from(light_remaining_accounts_count))
@@ -179,6 +288,7 @@ pub mod passkey_registry {
             current_authority.passkey_pubkey_prefix,
             &current_authority.passkey_pubkey_x,
         )?;
+        // The passkey signs both payload bytes and metas, so callers cannot swap accounts.
         let squads_payload_hash = hashv(&[squads_payload.as_slice()]).to_bytes();
         let squads_accounts_hash = hash_squads_instruction_accounts(squads_instruction_accounts);
         let execution_challenge = build_execution_challenge(
@@ -268,6 +378,41 @@ pub struct CreatePasskeyAuthority<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializePoolDirectory<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        constraint = pool_allocator.version == POOL_ALLOCATOR_VERSION,
+        constraint = pool_allocator.status == POOL_ALLOCATOR_STATUS_ACTIVE
+    )]
+    pub pool_allocator: Account<'info, PoolAllocator>,
+    /// CHECK: validated against the supplied pool index and Squads settings shape.
+    pub squads_settings: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AdvancePoolDirectory<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        constraint = current_pool_allocator.version == POOL_ALLOCATOR_VERSION,
+        constraint = current_pool_allocator.status == POOL_ALLOCATOR_STATUS_ACTIVE
+    )]
+    pub current_pool_allocator: Account<'info, PoolAllocator>,
+    /// CHECK: validated as the next deterministic Squads settings account.
+    pub new_squads_settings: UncheckedAccount<'info>,
+    #[account(
+        init,
+        payer = payer,
+        space = PoolAllocator::SPACE,
+        seeds = [POOL_ALLOCATOR_SEED, new_squads_settings.key().as_ref()],
+        bump
+    )]
+    pub new_pool_allocator: Account<'info, PoolAllocator>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct ExecutePasskeyVaultTransaction<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -285,6 +430,7 @@ pub struct ExecutePasskeyVaultTransaction<'info> {
     pub instructions: UncheckedAccount<'info>,
 }
 
+/// Hot, rent-paid state for the next vault index in one Squads settings pool.
 #[account]
 #[derive(Debug, Default)]
 pub struct PoolAllocator {
@@ -317,8 +463,22 @@ impl PoolAllocator {
             .ok_or_else(|| error!(PasskeyRegistryError::PoolExhausted))?;
         Ok(())
     }
+
+    pub fn is_exhausted(&self) -> bool {
+        self.next_index > u16::from(u8::MAX)
+    }
 }
 
+/// Compressed cursor pointing clients to the active Squads settings seed without scanning old allocators.
+#[event]
+#[derive(Clone, Debug, Default, LightDiscriminator)]
+pub struct PoolDirectory {
+    pub version: u8,
+    pub status: u8,
+    pub active_pool_index: u128,
+}
+
+/// Per-passkey compressed authority record that stores the vault binding only.
 #[event]
 #[derive(Clone, Debug, Default, LightDiscriminator)]
 pub struct PasskeyAuthority {
@@ -409,6 +569,17 @@ pub fn derive_verifier_pda() -> (Pubkey, u8) {
     Pubkey::find_program_address(&[VERIFIER_SEED], &crate::ID)
 }
 
+pub fn derive_squads_settings(pool_index: u128) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            SQUADS_SEED_PREFIX,
+            SQUADS_SEED_SETTINGS,
+            &pool_index.to_le_bytes(),
+        ],
+        &SQUADS_SMART_ACCOUNT_PROGRAM_ID,
+    )
+}
+
 pub fn derive_squads_vault(squads_settings: &Pubkey, vault_index: u8) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[
@@ -469,6 +640,77 @@ fn validate_current_authority(
     Ok(())
 }
 
+fn validate_active_pool_accounts(
+    allocator: &Account<'_, PoolAllocator>,
+    squads_settings: &UncheckedAccount<'_>,
+    pool_index: u128,
+) -> Result<()> {
+    let (expected_settings, _) = derive_squads_settings(pool_index);
+    if squads_settings.key() != expected_settings || allocator.squads_settings != expected_settings
+    {
+        return err!(PasskeyRegistryError::InvalidSquadsSettings);
+    }
+
+    let (expected_allocator, _) = Pubkey::find_program_address(
+        &[POOL_ALLOCATOR_SEED, expected_settings.as_ref()],
+        &crate::ID,
+    );
+    if allocator.key() != expected_allocator {
+        return err!(PasskeyRegistryError::InvalidPoolAllocator);
+    }
+
+    let (verifier, _) = derive_verifier_pda();
+    validate_squads_pool_settings(squads_settings.as_ref(), &verifier)
+}
+
+fn validate_exhausted_pool_allocator(
+    allocator: &Account<'_, PoolAllocator>,
+    active_pool_index: u128,
+) -> Result<()> {
+    let (expected_settings, _) = derive_squads_settings(active_pool_index);
+    if allocator.squads_settings != expected_settings {
+        return err!(PasskeyRegistryError::InvalidSquadsSettings);
+    }
+
+    let (expected_allocator, _) = Pubkey::find_program_address(
+        &[POOL_ALLOCATOR_SEED, expected_settings.as_ref()],
+        &crate::ID,
+    );
+    if allocator.key() != expected_allocator {
+        return err!(PasskeyRegistryError::InvalidPoolAllocator);
+    }
+
+    if !allocator.is_exhausted() {
+        return err!(PasskeyRegistryError::PoolStillHasCapacity);
+    }
+
+    Ok(())
+}
+
+fn validate_current_pool_directory(
+    directory: &PoolDirectory,
+    account_meta: &CompressedAccountMeta,
+    expected_active_pool_index: u128,
+) -> Result<()> {
+    if directory.version != POOL_DIRECTORY_VERSION
+        || directory.status != POOL_DIRECTORY_STATUS_ACTIVE
+    {
+        return err!(PasskeyRegistryError::InactivePoolDirectory);
+    }
+
+    if directory.active_pool_index != expected_active_pool_index {
+        return err!(PasskeyRegistryError::PoolDirectoryIndexChanged);
+    }
+
+    let address_tree = Pubkey::new_from_array(ADDRESS_TREE_V2);
+    let (expected_address, _) = derive_address(&[POOL_DIRECTORY_SEED], &address_tree, &crate::ID);
+    if account_meta.address != expected_address {
+        return err!(PasskeyRegistryError::InvalidPoolDirectoryAddress);
+    }
+
+    Ok(())
+}
+
 fn validate_squads_pool_settings(
     settings_account: &AccountInfo<'_>,
     verifier: &Pubkey,
@@ -486,6 +728,7 @@ fn validate_squads_pool_settings(
     let settings = SquadsSettingsView::deserialize(&mut body)
         .map_err(|_| error!(PasskeyRegistryError::InvalidSquadsSettings))?;
 
+    // Pool settings must stay static: one verifier signer, no time lock, no authority.
     if settings.settings_authority != Pubkey::default()
         || settings.threshold != 1
         || settings.time_lock != 0
@@ -575,6 +818,7 @@ fn verify_secp256r1_instruction(
     expected_pubkey: &[u8; 33],
     expected_message: &[u8],
 ) -> Result<()> {
+    // The precompile verifies the signature; this binds it to our expected key and message.
     let current_instruction_index = load_current_index_checked(instructions)
         .map_err(|_| error!(PasskeyRegistryError::InvalidSecp256r1Instruction))?;
     if u16::from(instruction_index) >= current_instruction_index {
@@ -697,6 +941,18 @@ pub enum PasskeyRegistryError {
     InvalidRegistrationChallenge,
     #[msg("The Squads vault pool is exhausted")]
     PoolExhausted,
+    #[msg("The pool allocator PDA does not match the supplied Squads settings account")]
+    InvalidPoolAllocator,
+    #[msg("The current Squads vault pool still has free vault indexes")]
+    PoolStillHasCapacity,
+    #[msg("The pool directory index overflowed")]
+    PoolIndexOverflow,
+    #[msg("The pool directory is not active")]
+    InactivePoolDirectory,
+    #[msg("The compressed pool directory address does not match the expected cursor")]
+    InvalidPoolDirectoryAddress,
+    #[msg("The active pool index changed before the pool directory could advance")]
+    PoolDirectoryIndexChanged,
     #[msg("The allocator index changed before the passkey authority could be created")]
     AllocatorIndexChanged,
     #[msg("The passkey authority is not active")]

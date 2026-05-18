@@ -14,9 +14,25 @@ Before registration, the pool has one tiny normal PDA allocator:
 
 The allocator stores only version, status, `squads_settings`, and `next_index`. It uses monotonic allocation from index `0` through `255`; there is no bitmap or slot reuse in the MVP.
 
+Pool discovery is tracked separately from per-user allocation. A single Light compressed PDA acts as the pool directory:
+
+```text
+["pool-directory"]
+```
+
+The directory stores version, status, and `active_pool_index`. That index is the deterministic Squads settings seed used to derive the currently active settings PDA:
+
+```text
+["smart_account", "settings", active_pool_index]
+```
+
+Clients read the compressed directory to find the active Squads settings account, derive that pool's allocator, and submit registration against that allocator. Registration itself does not update the directory, so the hot path stays one allocator write plus one compressed passkey record creation.
+
 The registration challenge binds the registry program id, Ed25519 authority, credential id hash, compressed P-256 public key, Light address tree, assigned Squads settings account, assigned vault index, and initial nonce.
 
 The passkey signs that challenge with P-256. The transaction includes the Solana `secp256r1` precompile instruction first, then the registry instruction. The Ed25519 authority signs the transaction as the Solana authority. On chain, the program checks that the precompile instruction contains the expected public key and message, verifies the allocator's current index, increments the allocator, then derives and creates the Light compressed PDA for the authority record.
+
+When an allocator reaches `next_index = 256`, the current Squads settings pool is full. The provisioning flow creates the next Squads smart account at `active_pool_index + 1`, then calls `advance_pool_directory`. That instruction verifies the current allocator is exhausted, validates the new Squads settings account has the static verifier-owned shape, initializes the new allocator PDA, and updates the compressed directory index by one.
 
 The tested flow currently creates the P-256 keypair and PRF-style Ed25519 keypair inside Rust tests. Browser-created passkeys and browser PRF extension output are deliberately out of scope for this first slice.
 
@@ -28,6 +44,10 @@ The program lives in `programs/passkey-registry`.
 
 `initialize_pool_allocator` creates the small hot allocator PDA for one Squads settings pool. It takes the actual Squads settings account, validates that it is the static verifier-owned shape expected by this design, and derives the allocator PDA from that settings key.
 
+`initialize_pool_directory` creates the compressed pool directory for the first active Squads settings index. It validates the supplied settings account and allocator before storing the active index.
+
+`advance_pool_directory` rolls the system to the next Squads settings pool. It refuses to advance early while the current allocator still has capacity, then initializes the next pool allocator and updates the compressed directory through a Light state transition.
+
 `create_passkey_authority` registers a user. It accepts a Light validity proof, packed address tree information, a target output state tree index, a `secp256r1` instruction index, the credential hash, and the compressed P-256 public key split into prefix plus x-coordinate. The vault index is not supplied by the client as trusted input; it is read from the allocator and signed in the passkey challenge.
 
 `execute_passkey_vault_transaction` updates the compressed nonce and CPIs into Squads `execute_transaction_sync_v2`. The verifier PDA signs the Squads CPI with program seeds and is expected to be the only Squads signer in the pool settings account. The passkey execution challenge binds the verifier PDA, Squads program id, settings account, vault index, nonce, expiry, payload hash, and remaining account metas hash.
@@ -38,6 +58,14 @@ The compressed PDA address is derived from:
 
 ```text
 ["passkey-authority", credential_id_hash]
+```
+
+plus the expected Light address tree and the passkey registry program id.
+
+The compressed pool directory address is derived from:
+
+```text
+["pool-directory"]
 ```
 
 plus the expected Light address tree and the passkey registry program id.
@@ -67,6 +95,8 @@ The passkey user is not added as a Squads signer, and the registry does not upda
 Allocator initialization and execution both check the supplied Squads settings account: it must be owned by the Squads program, have `settings_authority = Pubkey::default()`, `threshold = 1`, `time_lock = 0`, and exactly one signer, the registry verifier PDA with full permissions.
 
 The program uses all 256 possible vault indexes unless a future product decision explicitly reserves one.
+
+The directory/allocator split is deliberate. Putting the active pool cursor into the allocator would force clients to either know which allocator is current already or scan every allocator to find capacity. Updating the directory on every registration would make the compressed cursor part of the hot path. The current shape keeps the allocator hot and tiny, while the compressed directory is touched only on pool creation and rollover.
 
 ## Squads Execution Path
 
@@ -118,6 +148,8 @@ The first test layer uses LiteSVM to confirm the PRF-derived Ed25519 authority b
 
 The registration integration test uses `light-program-test` with SBF bytecode. It starts the Light test environment and prover, initializes a pool allocator, creates an in-test P-256 passkey keypair, builds and signs the registration challenge for allocator index `0`, airdrops lamports to the Ed25519 authority, submits the `secp256r1` precompile instruction plus registry instruction, creates the compressed PDA, fetches the compressed account back, and verifies the stored fields and allocator increment.
 
+The pool-directory integration tests create the compressed directory, verify it points at Squads settings seed `1`, simulate an exhausted allocator, create the next Squads smart account at seed `2`, advance the directory, and verify the next allocator starts at index `0`. A separate test confirms rollover fails while the current allocator still has free slots.
+
 The end-to-end Squads integration test also loads the real Squads smart-account SBF program. It seeds the Squads program config in the local LiteSVM environment, creates a Squads settings account with the verifier PDA as the only full-permission signer, initializes the registry allocator, creates the compressed passkey authority at vault index `0`, funds the vault, executes a passkey-authorized Squads sync transfer, and verifies both lamport movement and nonce increment.
 
 Run it with:
@@ -130,6 +162,6 @@ The SBF test path is the main correctness gate because it compiles the registry 
 
 ## Current Boundaries
 
-Implemented and tested today: allocator initialization, monotonic vault assignment, Light compressed PDA creation for passkey authority records, P-256 challenge verification through the Solana `secp256r1` precompile instruction, PRF-style Ed25519 transaction signing, Light validity proof packing through `light-program-test`, Squads settings creation with the verifier PDA as signer, and passkey-authorized Squads sync execution from vault index `0`.
+Implemented and tested today: allocator initialization, compressed pool-directory initialization and rollover, monotonic vault assignment, Light compressed PDA creation for passkey authority records, P-256 challenge verification through the Solana `secp256r1` precompile instruction, PRF-style Ed25519 transaction signing, Light validity proof packing through `light-program-test`, Squads settings creation with the verifier PDA as signer, and passkey-authorized Squads sync execution from vault index `0`.
 
 Still out of scope: browser WebAuthn ceremony integration, browser PRF extension integration, client-side hardening for real PRF material, production Squads pool provisioning, exact Squads settings rent measurement on the target deployment, update/revoke/rotate/close instructions, slot reuse/bitmap allocation, high-frequency hot nonce promotion, and application UI or API routes for registration.
