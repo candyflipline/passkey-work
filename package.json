@@ -18,7 +18,7 @@
     "magicblock:validator": "NO_DNA=1 RUST_LOG=info ephemeral-validator --accounts-lifecycle ephemeral --remote-cluster development --remote-url http://127.0.0.1:8899 --remote-ws-url ws://127.0.0.1:8900 --rpc-port 7799"
   },
   "dependencies": {
-    "@coral-xyz/anchor": "^0.32.1",
+    "@coral-xyz/anchor": "^0.31.1",
     "@lightprotocol/compressed-token": "^0.23.3",
     "@lightprotocol/stateless.js": "^0.23.3",
     "@solana/web3.js": "^1.98.0",

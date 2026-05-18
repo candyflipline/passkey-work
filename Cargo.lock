@@ -3127,6 +3127,7 @@ dependencies = [
  "solana-instruction",
  "solana-loader-v3-interface",
  "solana-msg",
+ "solana-program",
  "solana-program-error",
  "solana-pubkey",
  "solana-system-interface",

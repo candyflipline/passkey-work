@@ -12,7 +12,7 @@ Before registration, the pool has one tiny normal PDA allocator:
 ["pool-allocator", squads_settings]
 ```
 
-The allocator stores only version, status, `squads_settings`, `next_index`, `occupied_count`, and bump. It uses monotonic allocation from index `0` through `255`; there is no bitmap or slot reuse in the MVP.
+The allocator stores only version, status, `squads_settings`, and `next_index`. It uses monotonic allocation from index `0` through `255`; there is no bitmap or slot reuse in the MVP.
 
 The registration challenge binds the registry program id, Ed25519 authority, credential id hash, compressed P-256 public key, Light address tree, assigned Squads settings account, assigned vault index, and initial nonce.
 
@@ -26,7 +26,7 @@ The end-to-end Squads test creates the Squads settings account locally with the 
 
 The program lives in `programs/passkey-registry`.
 
-`initialize_pool_allocator` creates the small hot allocator PDA for one Squads settings pool.
+`initialize_pool_allocator` creates the small hot allocator PDA for one Squads settings pool. It takes the actual Squads settings account, validates that it is the static verifier-owned shape expected by this design, and derives the allocator PDA from that settings key.
 
 `create_passkey_authority` registers a user. It accepts a Light validity proof, packed address tree information, a target output state tree index, a `secp256r1` instruction index, the credential hash, and the compressed P-256 public key split into prefix plus x-coordinate. The vault index is not supplied by the client as trusted input; it is read from the allocator and signed in the passkey challenge.
 
@@ -64,7 +64,7 @@ signer = registry verifier PDA with Initiate + Vote + Execute
 
 The passkey user is not added as a Squads signer, and the registry does not update Squads settings during user registration. The registry allocator owns vault assignment. Squads `account_utilization` remains outside this flow.
 
-The execution path rechecks the supplied Squads settings account before CPI: it must be owned by the Squads program, have `settings_authority = Pubkey::default()`, `threshold = 1`, `time_lock = 0`, and exactly one signer, the registry verifier PDA with full permissions.
+Allocator initialization and execution both check the supplied Squads settings account: it must be owned by the Squads program, have `settings_authority = Pubkey::default()`, `threshold = 1`, `time_lock = 0`, and exactly one signer, the registry verifier PDA with full permissions.
 
 The program uses all 256 possible vault indexes unless a future product decision explicitly reserves one.
 

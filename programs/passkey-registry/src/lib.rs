@@ -6,7 +6,7 @@ use anchor_lang::solana_program::{
     hash::hashv,
     instruction::{AccountMeta, Instruction},
     program::invoke_signed,
-    sysvar::instructions::load_instruction_at_checked,
+    sysvar::instructions::{load_current_index_checked, load_instruction_at_checked},
 };
 use light_sdk::{
     account::LightAccount,
@@ -129,18 +129,17 @@ pub mod passkey_registry {
         Ok(())
     }
 
-    pub fn initialize_pool_allocator(
-        ctx: Context<InitializePoolAllocator>,
-        squads_settings: Pubkey,
-    ) -> Result<()> {
+    pub fn initialize_pool_allocator(ctx: Context<InitializePoolAllocator>) -> Result<()> {
+        let squads_settings = ctx.accounts.squads_settings.key();
+        let (verifier, _) = derive_verifier_pda();
+        validate_squads_pool_settings(ctx.accounts.squads_settings.as_ref(), &verifier)?;
+
         let allocator = &mut ctx.accounts.pool_allocator;
 
         allocator.version = POOL_ALLOCATOR_VERSION;
         allocator.status = POOL_ALLOCATOR_STATUS_ACTIVE;
         allocator.squads_settings = squads_settings;
         allocator.next_index = 0;
-        allocator.occupied_count = 0;
-        allocator.bump = ctx.bumps.pool_allocator;
 
         Ok(())
     }
@@ -237,15 +236,16 @@ pub mod passkey_registry {
 }
 
 #[derive(Accounts)]
-#[instruction(squads_settings: Pubkey)]
 pub struct InitializePoolAllocator<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
+    /// CHECK: validated as a static Squads settings account before storing the pool.
+    pub squads_settings: UncheckedAccount<'info>,
     #[account(
         init,
         payer = payer,
         space = PoolAllocator::SPACE,
-        seeds = [POOL_ALLOCATOR_SEED, squads_settings.as_ref()],
+        seeds = [POOL_ALLOCATOR_SEED, squads_settings.key().as_ref()],
         bump
     )]
     pub pool_allocator: Account<'info, PoolAllocator>,
@@ -292,12 +292,10 @@ pub struct PoolAllocator {
     pub status: u8,
     pub squads_settings: Pubkey,
     pub next_index: u16,
-    pub occupied_count: u16,
-    pub bump: u8,
 }
 
 impl PoolAllocator {
-    pub const SPACE: usize = 8 + 1 + 1 + 32 + 2 + 2 + 1;
+    pub const SPACE: usize = 8 + 1 + 1 + 32 + 2;
 
     pub fn next_vault_index(&self) -> Result<u8> {
         if self.next_index > u16::from(u8::MAX) {
@@ -317,11 +315,6 @@ impl PoolAllocator {
             .next_index
             .checked_add(1)
             .ok_or_else(|| error!(PasskeyRegistryError::PoolExhausted))?;
-        self.occupied_count = self
-            .occupied_count
-            .checked_add(1)
-            .ok_or_else(|| error!(PasskeyRegistryError::PoolExhausted))?;
-
         Ok(())
     }
 }
@@ -582,6 +575,12 @@ fn verify_secp256r1_instruction(
     expected_pubkey: &[u8; 33],
     expected_message: &[u8],
 ) -> Result<()> {
+    let current_instruction_index = load_current_index_checked(instructions)
+        .map_err(|_| error!(PasskeyRegistryError::InvalidSecp256r1Instruction))?;
+    if u16::from(instruction_index) >= current_instruction_index {
+        return err!(PasskeyRegistryError::Secp256r1InstructionMustPrecedeRegistry);
+    }
+
     let instruction = load_instruction_at_checked(instruction_index as usize, instructions)
         .map_err(|_| error!(PasskeyRegistryError::MissingSecp256r1Instruction))?;
 
@@ -716,4 +715,6 @@ pub enum PasskeyRegistryError {
     InvalidRemainingAccountsSplit,
     #[msg("The Squads synchronous transaction payload could not be serialized")]
     InvalidSquadsSyncPayload,
+    #[msg("The secp256r1 verification instruction must precede the registry instruction")]
+    Secp256r1InstructionMustPrecedeRegistry,
 }

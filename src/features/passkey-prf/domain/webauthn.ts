@@ -71,7 +71,6 @@ export async function createPasskeyForAddress(address: string) {
       },
       pubKeyCredParams: [
         { type: "public-key", alg: -7 },
-        { type: "public-key", alg: -257 },
       ],
       authenticatorSelection: {
         residentKey: "required",

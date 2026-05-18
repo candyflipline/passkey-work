@@ -1,49 +1,31 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Passkey Work
 
-## Getting Started
+This repo is Loyal's sandbox for passkey-based Solana onboarding. It currently includes:
 
-First, run the development server:
+- A Next.js App Router app under `src/app`.
+- A browser PRF tester in `src/features/passkey-prf`.
+- A Solana program in `programs/passkey-registry` for Light Protocol compressed passkey authority records and pooled Squads vault assignment.
+- Local docs for the program test flow under `docs/`.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-## Solana and MagicBlock Setup
-
-This repo includes an empty Anchor workspace for future programs, plus the MagicBlock local validator configuration copied from Loyal's app repo. No programs have been added yet.
-
-Useful commands:
+## Commands
 
 ```bash
+bun install
+bun run dev
+bun run build
+bun run lint
 bun run anchor:build
-bun run solana:validator
-bun run magicblock:validator
-bun run anchor:test:localnet
+bun run test:sbf
 ```
 
-See [docs/solana/localnet-testing.md](./docs/solana/localnet-testing.md) for the three-terminal localnet flow.
+`bun run test:sbf` is the main program correctness gate. It compiles the registry to SBF, runs the Light compressed account flow, and exercises the local Squads synchronous execution path. The Squads E2E test expects `squads_smart_account_program.so` to be available in `target/deploy`.
 
-## Learn More
+## Program Notes
 
-To learn more about Next.js, take a look at the following resources:
+The registry stores per-user authority records as Light compressed PDAs, assigns each record a vault index from one shared Squads settings pool, and uses a verifier PDA as the sole Squads signer for synchronous execution.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Start with:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- [Passkey registry architecture](./docs/passkey-registry-architecture.md)
+- [Sponsorship cost report](./docs/passkey-sponsorship-cost-report.md)
+- [Solana localnet testing](./docs/solana/localnet-testing.md)

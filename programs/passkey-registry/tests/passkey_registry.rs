@@ -49,8 +49,6 @@ fn pool_allocator_uses_all_256_vault_indexes() {
         status: POOL_ALLOCATOR_STATUS_ACTIVE,
         squads_settings,
         next_index: 0,
-        occupied_count: 0,
-        bump: 255,
     };
 
     for expected_index in 0..=u8::MAX {
@@ -59,7 +57,6 @@ fn pool_allocator_uses_all_256_vault_indexes() {
     }
 
     assert_eq!(allocator.next_index, 256);
-    assert_eq!(allocator.occupied_count, 256);
     assert!(allocator.next_vault_index().is_err());
 }
 
@@ -70,12 +67,23 @@ async fn creates_passkey_authority_compressed_pda() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     install_light_cli_shim();
 
-    let config =
-        ProgramTestConfig::new_v2(true, Some(vec![("passkey_registry", passkey_registry::ID)]));
+    let config = ProgramTestConfig::new_v2(
+        true,
+        Some(vec![
+            ("passkey_registry", passkey_registry::ID),
+            (
+                SQUADS_SMART_ACCOUNT_PROGRAM_NAME,
+                passkey_registry::SQUADS_SMART_ACCOUNT_PROGRAM_ID,
+            ),
+        ]),
+    );
     let mut rpc = LightProgramTest::new(config).await.unwrap();
     let payer = rpc.get_payer().insecure_clone();
     let authority = prf_derived_authority();
-    let squads_settings = Keypair::new().pubkey();
+    let (verifier, _) = passkey_registry::derive_verifier_pda();
+    let squads_settings = create_squads_smart_account(&mut rpc, &payer, verifier)
+        .await
+        .unwrap();
     let (pool_allocator, _) = solana_sdk::pubkey::Pubkey::find_program_address(
         &[POOL_ALLOCATOR_SEED, squads_settings.as_ref()],
         &passkey_registry::ID,
@@ -152,7 +160,43 @@ async fn creates_passkey_authority_compressed_pda() {
     let allocator = PoolAllocator::try_deserialize(&mut allocator_account.data.as_slice()).unwrap();
     assert_eq!(allocator.squads_settings, squads_settings);
     assert_eq!(allocator.next_index, 1);
-    assert_eq!(allocator.occupied_count, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rejects_allocator_for_unvalidated_squads_settings() {
+    let _guard = LIGHT_PROGRAM_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    install_light_cli_shim();
+
+    let config =
+        ProgramTestConfig::new_v2(true, Some(vec![("passkey_registry", passkey_registry::ID)]));
+    let mut rpc = LightProgramTest::new(config).await.unwrap();
+    let payer = rpc.get_payer().insecure_clone();
+    let fake_settings = Keypair::new().pubkey();
+    let (pool_allocator, _) = Pubkey::find_program_address(
+        &[POOL_ALLOCATOR_SEED, fake_settings.as_ref()],
+        &passkey_registry::ID,
+    );
+
+    rpc.context
+        .set_account(
+            fake_settings,
+            Account {
+                lamports: 1_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    assert!(
+        initialize_pool_allocator(&mut rpc, &payer, pool_allocator, fake_settings)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -277,6 +321,73 @@ async fn passkey_verifier_executes_squads_vault_transfer() {
     assert_eq!(authority_record.nonce, 1);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn rejects_secp256r1_instruction_after_registry_instruction() {
+    let _guard = LIGHT_PROGRAM_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    install_light_cli_shim();
+
+    let config = ProgramTestConfig::new_v2(
+        true,
+        Some(vec![
+            ("passkey_registry", passkey_registry::ID),
+            (
+                SQUADS_SMART_ACCOUNT_PROGRAM_NAME,
+                passkey_registry::SQUADS_SMART_ACCOUNT_PROGRAM_ID,
+            ),
+        ]),
+    );
+    let mut rpc = LightProgramTest::new(config).await.unwrap();
+    let payer = rpc.get_payer().insecure_clone();
+    let authority = prf_derived_authority();
+    let (verifier, _) = passkey_registry::derive_verifier_pda();
+    let squads_settings = create_squads_smart_account(&mut rpc, &payer, verifier)
+        .await
+        .unwrap();
+    let (pool_allocator, _) = Pubkey::find_program_address(
+        &[POOL_ALLOCATOR_SEED, squads_settings.as_ref()],
+        &passkey_registry::ID,
+    );
+
+    initialize_pool_allocator(&mut rpc, &payer, pool_allocator, squads_settings)
+        .await
+        .unwrap();
+    rpc.airdrop_lamports(&authority.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
+
+    let credential_id_hash = hash32(b"loyal-test-late-secp-credential-id");
+    let address_tree_info = rpc.get_address_tree_v2();
+    let (address, _) = derive_address(
+        &[PASSKEY_AUTHORITY_SEED, credential_id_hash.as_ref()],
+        &address_tree_info.tree,
+        &passkey_registry::ID,
+    );
+    let (passkey_pubkey_compressed, secp256r1_instruction) = create_passkey_signature_instruction(
+        &credential_id_hash,
+        &authority.pubkey(),
+        &address_tree_info.tree,
+        &squads_settings,
+        0,
+    );
+
+    assert!(create_passkey_authority_with_instruction_order(
+        &mut rpc,
+        &payer,
+        &authority,
+        pool_allocator,
+        &address,
+        secp256r1_instruction,
+        credential_id_hash,
+        passkey_pubkey_compressed,
+        1,
+        false,
+    )
+    .await
+    .is_err());
+}
+
 async fn initialize_pool_allocator(
     rpc: &mut LightProgramTest,
     payer: &Keypair,
@@ -287,10 +398,11 @@ async fn initialize_pool_allocator(
         program_id: passkey_registry::ID,
         accounts: vec![
             AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(squads_settings, false),
             AccountMeta::new(pool_allocator, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
-        data: passkey_registry::instruction::InitializePoolAllocator { squads_settings }.data(),
+        data: passkey_registry::instruction::InitializePoolAllocator {}.data(),
     };
 
     rpc.create_and_send_transaction(&[instruction], &payer.pubkey(), &[payer])
@@ -314,6 +426,33 @@ async fn create_passkey_authority(
     secp256r1_instruction: Instruction,
     credential_id_hash: [u8; 32],
     passkey_pubkey_compressed: [u8; 33],
+) -> Result<Signature, RpcError> {
+    create_passkey_authority_with_instruction_order(
+        rpc,
+        payer,
+        authority,
+        pool_allocator,
+        address,
+        secp256r1_instruction,
+        credential_id_hash,
+        passkey_pubkey_compressed,
+        0,
+        true,
+    )
+    .await
+}
+
+async fn create_passkey_authority_with_instruction_order(
+    rpc: &mut LightProgramTest,
+    payer: &Keypair,
+    authority: &Keypair,
+    pool_allocator: solana_sdk::pubkey::Pubkey,
+    address: &[u8; 32],
+    secp256r1_instruction: Instruction,
+    credential_id_hash: [u8; 32],
+    passkey_pubkey_compressed: [u8; 33],
+    secp256r1_instruction_index: u8,
+    secp256r1_first: bool,
 ) -> Result<Signature, RpcError> {
     let passkey_pubkey_x: [u8; 32] = passkey_pubkey_compressed[1..].try_into().unwrap();
 
@@ -354,7 +493,7 @@ async fn create_passkey_authority(
             proof: proof_result.proof,
             address_tree_info: packed_accounts.address_trees[0],
             output_state_tree_index,
-            secp256r1_instruction_index: 0,
+            secp256r1_instruction_index,
             credential_id_hash,
             passkey_pubkey_prefix: passkey_pubkey_compressed[0],
             passkey_pubkey_x,
@@ -362,12 +501,14 @@ async fn create_passkey_authority(
         .data(),
     };
 
-    rpc.create_and_send_transaction(
-        &[secp256r1_instruction, create_instruction],
-        &payer.pubkey(),
-        &[payer, authority],
-    )
-    .await
+    let instructions = if secp256r1_first {
+        vec![secp256r1_instruction, create_instruction]
+    } else {
+        vec![create_instruction, secp256r1_instruction]
+    };
+
+    rpc.create_and_send_transaction(&instructions, &payer.pubkey(), &[payer, authority])
+        .await
 }
 
 fn create_passkey_signature_instruction(

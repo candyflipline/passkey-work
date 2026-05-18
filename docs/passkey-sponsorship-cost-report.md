@@ -20,7 +20,7 @@ That is the SDK default `Rent::minimum_balance` formula, with the 128-byte accou
 | --- | ---: | ---: |
 | Normal `PasskeyAuthority` PDA | 148 | 1,920,960 lamports / 0.00192096 SOL |
 | Squads `Settings` account, 1 signer | 168 | 2,060,160 lamports / 0.00206016 SOL |
-| Registry `PoolAllocator` PDA | 47 | 1,218,000 lamports / 0.001218 SOL |
+| Registry `PoolAllocator` PDA | 44 | 1,197,120 lamports / 0.00119712 SOL |
 
 The normal passkey PDA estimate assumes the current `PasskeyAuthority` payload stored as a regular Anchor account: 8 bytes of account discriminator plus 140 bytes of authority data. The authority data is:
 
@@ -44,11 +44,11 @@ The Squads settings estimate follows the local Squads smart-account program used
 | Route | Accounts sponsored | Total rent reserve |
 | --- | --- | ---: |
 | Direct route | 256 normal passkey PDAs + 256 Squads settings accounts | 1,019,166,720 lamports / 1.01916672 SOL |
-| Current pooled route | 256 compressed passkey records + 1 Squads settings account + 1 allocator PDA | 3,278,160 lamports / 0.00327816 SOL |
+| Current pooled route | 256 compressed passkey records + 1 Squads settings account + 1 allocator PDA | 3,257,280 lamports / 0.00325728 SOL |
 
-Per user, the direct route requires 3,981,120 lamports, or 0.00398112 SOL, before transaction fees. The pooled route amortizes to 12,805.3125 lamports, or 0.0000128053125 SOL, of rent reserve per available vault slot across the 256-user pool.
+Per user, the direct route requires 3,981,120 lamports, or 0.00398112 SOL, before transaction fees. The pooled route amortizes to 12,723.75 lamports, or 0.00001272375 SOL, of rent reserve per available vault slot across the 256-user pool.
 
-That means the current pooled route uses about 310.9x less rent than the direct route for a full 256-user pool. It removes 1.01588856 SOL of rent reserve from this 256-user sponsorship batch, a 99.68% reduction in rent locked up for account creation.
+That means the current pooled route uses about 312.9x less rent than the direct route for a full 256-user pool. It removes 1.01590944 SOL of rent reserve from this 256-user sponsorship batch, a 99.68% reduction in rent locked up for account creation.
 
 ## Why The Current Logic Supports This
 
