@@ -26,6 +26,7 @@ use solana_sdk::{
     hash::hashv,
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    rent::Rent,
     signature::{Keypair, Signature, Signer},
     system_instruction, sysvar,
 };
@@ -52,6 +53,7 @@ fn pool_allocator_uses_all_256_vault_indexes() {
         status: POOL_ALLOCATOR_STATUS_ACTIVE,
         squads_settings,
         next_index: 0,
+        ..Default::default()
     };
 
     for expected_index in 0..=u8::MAX {
@@ -71,6 +73,7 @@ fn pool_allocator_reports_capacity_for_rollover() {
         status: POOL_ALLOCATOR_STATUS_ACTIVE,
         squads_settings,
         next_index: 255,
+        ..Default::default()
     };
 
     assert!(!allocator.is_exhausted());
@@ -183,6 +186,87 @@ async fn creates_passkey_authority_compressed_pda() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn pool_allocator_can_hold_and_withdraw_rollover_float() {
+    let _guard = LIGHT_PROGRAM_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    install_light_cli_shim();
+
+    let config = ProgramTestConfig::new_v2(
+        true,
+        Some(vec![
+            ("passkey_registry", passkey_registry::ID),
+            (
+                SQUADS_SMART_ACCOUNT_PROGRAM_NAME,
+                passkey_registry::SQUADS_SMART_ACCOUNT_PROGRAM_ID,
+            ),
+        ]),
+    );
+    let mut rpc = LightProgramTest::new(config).await.unwrap();
+    let payer = rpc.get_payer().insecure_clone();
+    let (verifier, _) = passkey_registry::derive_verifier_pda();
+    let squads_settings = create_squads_smart_account(&mut rpc, &payer, verifier, 1)
+        .await
+        .unwrap();
+    let (pool_allocator, _) = Pubkey::find_program_address(
+        &[POOL_ALLOCATOR_SEED, squads_settings.as_ref()],
+        &passkey_registry::ID,
+    );
+    initialize_pool_allocator(&mut rpc, &payer, pool_allocator, squads_settings)
+        .await
+        .unwrap();
+
+    let allocator_start_balance = get_balance_or_zero(&rpc, pool_allocator).await;
+    fund_pool_allocator(&mut rpc, &payer, pool_allocator, 7_000_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_balance_or_zero(&rpc, pool_allocator).await,
+        allocator_start_balance + 7_000_000
+    );
+
+    let unauthorized = Keypair::new();
+    rpc.airdrop_lamports(&unauthorized.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
+    assert!(withdraw_pool_allocator_surplus(
+        &mut rpc,
+        &unauthorized,
+        pool_allocator,
+        unauthorized.pubkey(),
+        1_000_000,
+        allocator_start_balance
+    )
+    .await
+    .is_err());
+
+    let recipient = Keypair::new();
+    rpc.airdrop_lamports(&recipient.pubkey(), 1_000_000)
+        .await
+        .unwrap();
+    let recipient_start_balance = get_balance_or_zero(&rpc, recipient.pubkey()).await;
+    withdraw_pool_allocator_surplus(
+        &mut rpc,
+        &payer,
+        pool_allocator,
+        recipient.pubkey(),
+        2_000_000,
+        allocator_start_balance + 5_000_000,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        get_balance_or_zero(&rpc, recipient.pubkey()).await,
+        recipient_start_balance + 2_000_000
+    );
+    assert_eq!(
+        get_balance_or_zero(&rpc, pool_allocator).await,
+        allocator_start_balance + 5_000_000
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn pool_directory_tracks_the_active_squads_pool() {
     let _guard = LIGHT_PROGRAM_TEST_LOCK
         .lock()
@@ -243,26 +327,81 @@ async fn pool_directory_tracks_the_active_squads_pool() {
     assert_eq!(directory.status, POOL_DIRECTORY_STATUS_ACTIVE);
     assert_eq!(directory.active_pool_index, first_pool_index);
 
-    mark_pool_allocator_exhausted(&mut rpc, first_pool_allocator).await;
-
-    let next_pool_index = first_pool_index + 1;
-    let next_squads_settings =
-        create_squads_smart_account(&mut rpc, &payer, verifier, next_pool_index)
+    set_pool_allocator_next_index(&mut rpc, first_pool_allocator, 250).await;
+    for vault_index in 250..=u8::MAX {
+        let authority = Keypair::new();
+        rpc.airdrop_lamports(&authority.pubkey(), 1_000_000)
             .await
             .unwrap();
+        let credential_id_hash =
+            hashv(&[b"loyal-test-near-full-pool-credential", &[vault_index]]).to_bytes();
+        let (authority_address, _) = derive_address(
+            &[PASSKEY_AUTHORITY_SEED, credential_id_hash.as_ref()],
+            &address_tree_info.tree,
+            &passkey_registry::ID,
+        );
+        let (passkey_pubkey_compressed, secp256r1_instruction) =
+            create_passkey_signature_instruction(
+                &credential_id_hash,
+                &authority.pubkey(),
+                &address_tree_info.tree,
+                &first_squads_settings,
+                vault_index,
+            );
+
+        create_passkey_authority(
+            &mut rpc,
+            &payer,
+            &authority,
+            first_pool_allocator,
+            &authority_address,
+            secp256r1_instruction,
+            credential_id_hash,
+            passkey_pubkey_compressed,
+        )
+        .await
+        .unwrap();
+
+        let authority_record = fetch_passkey_authority(&rpc, authority_address).await;
+        assert_eq!(authority_record.squads_settings, first_squads_settings);
+        assert_eq!(authority_record.vault_index, vault_index);
+    }
+
+    let first_allocator_account = rpc
+        .get_account(first_pool_allocator)
+        .await
+        .unwrap()
+        .unwrap();
+    let first_allocator =
+        PoolAllocator::try_deserialize(&mut first_allocator_account.data.as_slice()).unwrap();
+    assert_eq!(first_allocator.next_index, 256);
+    assert!(first_allocator.is_exhausted());
+
+    rpc.airdrop_lamports(&first_pool_allocator, 20_000_000)
+        .await
+        .unwrap();
+    let first_allocator_start_balance = get_balance_or_zero(&rpc, first_pool_allocator).await;
+    let next_allocator_lamports = 5_000_000;
+
+    let next_pool_index = first_pool_index + 1;
+    let next_squads_settings = passkey_registry::derive_squads_settings(next_pool_index).0;
     let (next_pool_allocator, _) = Pubkey::find_program_address(
         &[POOL_ALLOCATOR_SEED, next_squads_settings.as_ref()],
         &passkey_registry::ID,
     );
+    let program_config = derive_squads_program_config();
 
-    advance_pool_directory(
+    provision_next_pool(
         &mut rpc,
         &payer,
         first_pool_allocator,
+        program_config,
+        squads_treasury(),
         next_squads_settings,
         next_pool_allocator,
         &directory_address,
         first_pool_index,
+        next_allocator_lamports,
     )
     .await
     .unwrap();
@@ -270,10 +409,71 @@ async fn pool_directory_tracks_the_active_squads_pool() {
     let directory = fetch_pool_directory(&rpc, directory_address).await;
     assert_eq!(directory.active_pool_index, next_pool_index);
 
+    let next_squads_settings_account = rpc
+        .get_account(next_squads_settings)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        next_squads_settings_account.owner,
+        passkey_registry::SQUADS_SMART_ACCOUNT_PROGRAM_ID
+    );
+
     let allocator_account = rpc.get_account(next_pool_allocator).await.unwrap().unwrap();
     let allocator = PoolAllocator::try_deserialize(&mut allocator_account.data.as_slice()).unwrap();
     assert_eq!(allocator.squads_settings, next_squads_settings);
     assert_eq!(allocator.next_index, 0);
+    assert!(allocator_account.lamports >= next_allocator_lamports);
+
+    let squads_settings_rent =
+        Rent::default().minimum_balance(passkey_registry::SQUADS_ONE_SIGNER_SETTINGS_SPACE);
+    assert_eq!(
+        get_balance_or_zero(&rpc, first_pool_allocator).await,
+        first_allocator_start_balance - squads_settings_rent - next_allocator_lamports
+    );
+    assert_eq!(
+        get_balance_or_zero(&rpc, next_squads_settings).await,
+        squads_settings_rent
+    );
+
+    let authority = prf_derived_authority();
+    rpc.airdrop_lamports(&authority.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
+    let credential_id_hash = hash32(b"loyal-test-post-rollover-credential-id");
+    let (authority_address, _) = derive_address(
+        &[PASSKEY_AUTHORITY_SEED, credential_id_hash.as_ref()],
+        &address_tree_info.tree,
+        &passkey_registry::ID,
+    );
+    let (passkey_pubkey_compressed, secp256r1_instruction) = create_passkey_signature_instruction(
+        &credential_id_hash,
+        &authority.pubkey(),
+        &address_tree_info.tree,
+        &next_squads_settings,
+        0,
+    );
+
+    create_passkey_authority(
+        &mut rpc,
+        &payer,
+        &authority,
+        next_pool_allocator,
+        &authority_address,
+        secp256r1_instruction,
+        credential_id_hash,
+        passkey_pubkey_compressed,
+    )
+    .await
+    .unwrap();
+
+    let authority_record = fetch_passkey_authority(&rpc, authority_address).await;
+    assert_eq!(authority_record.squads_settings, next_squads_settings);
+    assert_eq!(authority_record.vault_index, 0);
+
+    let allocator_account = rpc.get_account(next_pool_allocator).await.unwrap().unwrap();
+    let allocator = PoolAllocator::try_deserialize(&mut allocator_account.data.as_slice()).unwrap();
+    assert_eq!(allocator.next_index, 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -331,22 +531,24 @@ async fn pool_directory_does_not_advance_while_current_pool_has_capacity() {
     .await
     .unwrap();
 
-    let next_squads_settings = create_squads_smart_account(&mut rpc, &payer, verifier, 2)
-        .await
-        .unwrap();
+    let next_squads_settings = passkey_registry::derive_squads_settings(2).0;
     let (next_pool_allocator, _) = Pubkey::find_program_address(
         &[POOL_ALLOCATOR_SEED, next_squads_settings.as_ref()],
         &passkey_registry::ID,
     );
+    let program_config = derive_squads_program_config();
 
-    assert!(advance_pool_directory(
+    assert!(provision_next_pool(
         &mut rpc,
         &payer,
         first_pool_allocator,
+        program_config,
+        squads_treasury(),
         next_squads_settings,
         next_pool_allocator,
         &directory_address,
         first_pool_index,
+        5_000_000,
     )
     .await
     .is_err());
@@ -584,19 +786,161 @@ async fn initialize_pool_allocator(
     pool_allocator: solana_sdk::pubkey::Pubkey,
     squads_settings: solana_sdk::pubkey::Pubkey,
 ) -> Result<Signature, RpcError> {
+    let (compression_config, pda_rent_sponsor) =
+        ensure_pool_allocator_light_config(rpc, payer).await?;
+    let mut remaining_accounts = PackedAccounts::default();
+    remaining_accounts
+        .add_system_accounts_v2(SystemAccountMetaConfig::new(passkey_registry::ID))?;
+
+    let address_tree_info = rpc.get_address_tree_v2();
+    let light_pda_address = light_compressed_account::address::derive_address(
+        &pool_allocator.to_bytes(),
+        &address_tree_info.tree.to_bytes(),
+        &passkey_registry::ID.to_bytes(),
+    );
+    let proof_result = rpc
+        .get_validity_proof(
+            vec![],
+            vec![AddressWithTree {
+                address: light_pda_address,
+                tree: address_tree_info.tree,
+            }],
+            None,
+        )
+        .await?
+        .value;
+    let packed_accounts = proof_result.pack_tree_infos(&mut remaining_accounts);
+    let output_state_tree_index = rpc
+        .get_random_state_tree_info()?
+        .pack_output_tree_index(&mut remaining_accounts)?;
+    let (remaining_account_metas, _, _) = remaining_accounts.to_account_metas();
+
+    let create_accounts_proof = light_account::CreateAccountsProof {
+        proof: proof_result.proof,
+        address_tree_info: packed_accounts.address_trees[0],
+        output_state_tree_index,
+        state_tree_index: None,
+        system_accounts_offset: 0,
+    };
     let instruction = Instruction {
         program_id: passkey_registry::ID,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new_readonly(squads_settings, false),
-            AccountMeta::new(pool_allocator, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data: passkey_registry::instruction::InitializePoolAllocator {}.data(),
+        accounts: [
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(compression_config, false),
+                AccountMeta::new(pda_rent_sponsor, false),
+                AccountMeta::new_readonly(squads_settings, false),
+                AccountMeta::new(pool_allocator, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            remaining_account_metas,
+        ]
+        .concat(),
+        data: passkey_registry::instruction::InitializePoolAllocator {
+            params: passkey_registry::InitializePoolAllocatorParams {
+                create_accounts_proof,
+                squads_settings,
+                withdraw_authority: payer.pubkey(),
+            },
+        }
+        .data(),
     };
 
     rpc.create_and_send_transaction(&[instruction], &payer.pubkey(), &[payer])
         .await
+}
+
+async fn fund_pool_allocator(
+    rpc: &mut LightProgramTest,
+    funder: &Keypair,
+    pool_allocator: Pubkey,
+    lamports: u64,
+) -> Result<Signature, RpcError> {
+    let instruction = Instruction {
+        program_id: passkey_registry::ID,
+        accounts: vec![
+            AccountMeta::new(funder.pubkey(), true),
+            AccountMeta::new(pool_allocator, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: passkey_registry::instruction::FundPoolAllocator { lamports }.data(),
+    };
+
+    rpc.create_and_send_transaction(&[instruction], &funder.pubkey(), &[funder])
+        .await
+}
+
+async fn withdraw_pool_allocator_surplus(
+    rpc: &mut LightProgramTest,
+    withdraw_authority: &Keypair,
+    pool_allocator: Pubkey,
+    recipient: Pubkey,
+    lamports: u64,
+    minimum_lamports_to_keep: u64,
+) -> Result<Signature, RpcError> {
+    let instruction = Instruction {
+        program_id: passkey_registry::ID,
+        accounts: vec![
+            AccountMeta::new_readonly(withdraw_authority.pubkey(), true),
+            AccountMeta::new(pool_allocator, false),
+            AccountMeta::new(recipient, false),
+        ],
+        data: passkey_registry::instruction::WithdrawPoolAllocatorSurplus {
+            lamports,
+            minimum_lamports_to_keep,
+        }
+        .data(),
+    };
+
+    rpc.create_and_send_transaction(
+        &[instruction],
+        &withdraw_authority.pubkey(),
+        &[withdraw_authority],
+    )
+    .await
+}
+
+async fn ensure_pool_allocator_light_config(
+    rpc: &mut LightProgramTest,
+    payer: &Keypair,
+) -> Result<(Pubkey, Pubkey), RpcError> {
+    let config_bump = 0u16;
+    let (compression_config, _) = Pubkey::find_program_address(
+        &[light_account::LIGHT_CONFIG_SEED, &config_bump.to_le_bytes()],
+        &passkey_registry::ID,
+    );
+    let (pda_rent_sponsor, _) = light_account::derive_rent_sponsor_pda(&passkey_registry::ID);
+
+    if rpc.get_account(compression_config).await?.is_none() {
+        let address_tree = rpc.get_address_tree_v2().tree;
+        let instruction = Instruction {
+            program_id: passkey_registry::ID,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(compression_config, false),
+                AccountMeta::new_readonly(passkey_registry::ID, false),
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: passkey_registry::instruction::InitializeCompressionConfig {
+                params: passkey_registry::passkey_registry::InitConfigParams {
+                    write_top_up: 0,
+                    rent_sponsor: pda_rent_sponsor,
+                    compression_authority: payer.pubkey(),
+                    rent_config: light_account::RentConfig::default(),
+                    address_space: vec![address_tree],
+                },
+            }
+            .data(),
+        };
+        rpc.create_and_send_transaction(&[instruction], &payer.pubkey(), &[payer])
+            .await?;
+    }
+    if get_balance_or_zero(rpc, pda_rent_sponsor).await < 100_000_000 {
+        rpc.airdrop_lamports(&pda_rent_sponsor, 100_000_000).await?;
+    }
+
+    Ok((compression_config, pda_rent_sponsor))
 }
 
 async fn initialize_pool_directory(
@@ -653,15 +997,20 @@ async fn initialize_pool_directory(
         .await
 }
 
-async fn advance_pool_directory(
+async fn provision_next_pool(
     rpc: &mut LightProgramTest,
     payer: &Keypair,
     current_pool_allocator: Pubkey,
+    program_config: Pubkey,
+    treasury: Pubkey,
     new_squads_settings: Pubkey,
     new_pool_allocator: Pubkey,
     directory_address: &[u8; 32],
     expected_active_pool_index: u128,
+    next_allocator_lamports: u64,
 ) -> Result<Signature, RpcError> {
+    let (compression_config, pda_rent_sponsor) =
+        ensure_pool_allocator_light_config(rpc, payer).await?;
     let compressed_account = rpc
         .get_compressed_account(*directory_address, None)
         .await?
@@ -681,6 +1030,29 @@ async fn advance_pool_directory(
     let mut remaining_accounts = PackedAccounts::default();
     remaining_accounts
         .add_system_accounts_v2(SystemAccountMetaConfig::new(passkey_registry::ID))?;
+
+    let address_tree_info = rpc.get_address_tree_v2();
+    let light_pda_address = light_compressed_account::address::derive_address(
+        &new_pool_allocator.to_bytes(),
+        &address_tree_info.tree.to_bytes(),
+        &passkey_registry::ID.to_bytes(),
+    );
+    let create_proof_result = rpc
+        .get_validity_proof(
+            vec![],
+            vec![AddressWithTree {
+                address: light_pda_address,
+                tree: address_tree_info.tree,
+            }],
+            None,
+        )
+        .await?
+        .value;
+    let create_packed_accounts = create_proof_result.pack_tree_infos(&mut remaining_accounts);
+    let create_output_state_tree_index = rpc
+        .get_random_state_tree_info()?
+        .pack_output_tree_index(&mut remaining_accounts)?;
+
     let proof_result = rpc
         .get_validity_proof(vec![compressed_account.hash], vec![], None)
         .await?
@@ -701,19 +1073,35 @@ async fn advance_pool_directory(
         accounts: [
             vec![
                 AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(compression_config, false),
+                AccountMeta::new(pda_rent_sponsor, false),
                 AccountMeta::new(current_pool_allocator, false),
-                AccountMeta::new_readonly(new_squads_settings, false),
+                AccountMeta::new(program_config, false),
+                AccountMeta::new(treasury, false),
+                AccountMeta::new(new_squads_settings, false),
                 AccountMeta::new(new_pool_allocator, false),
+                AccountMeta::new_readonly(passkey_registry::SQUADS_SMART_ACCOUNT_PROGRAM_ID, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             remaining_account_metas,
         ]
         .concat(),
-        data: passkey_registry::instruction::AdvancePoolDirectory {
-            proof: proof_result.proof,
-            account_meta,
-            expected_active_pool_index,
-            current_directory,
+        data: passkey_registry::instruction::ProvisionNextPool {
+            params: passkey_registry::ProvisionNextPoolParams {
+                create_accounts_proof: light_account::CreateAccountsProof {
+                    proof: create_proof_result.proof,
+                    address_tree_info: create_packed_accounts.address_trees[0],
+                    output_state_tree_index: create_output_state_tree_index,
+                    state_tree_index: None,
+                    system_accounts_offset: 0,
+                },
+                directory_proof: proof_result.proof,
+                directory_account_meta: account_meta,
+                expected_active_pool_index,
+                current_directory,
+                new_squads_settings,
+                next_allocator_lamports,
+            },
         }
         .data(),
     };
@@ -735,10 +1123,27 @@ async fn fetch_pool_directory(
     PoolDirectory::deserialize(&mut &compressed_account.data.as_ref().unwrap().data[..]).unwrap()
 }
 
-async fn mark_pool_allocator_exhausted(rpc: &mut LightProgramTest, pool_allocator: Pubkey) {
+async fn fetch_passkey_authority(
+    rpc: &LightProgramTest,
+    authority_address: [u8; 32],
+) -> PasskeyAuthority {
+    let compressed_account = rpc
+        .get_compressed_account(authority_address, None)
+        .await
+        .unwrap()
+        .value
+        .unwrap();
+    PasskeyAuthority::deserialize(&mut &compressed_account.data.as_ref().unwrap().data[..]).unwrap()
+}
+
+async fn set_pool_allocator_next_index(
+    rpc: &mut LightProgramTest,
+    pool_allocator: Pubkey,
+    next_index: u16,
+) {
     let mut account = rpc.get_account(pool_allocator).await.unwrap().unwrap();
     let mut allocator = PoolAllocator::try_deserialize(&mut account.data.as_slice()).unwrap();
-    allocator.next_index = 256;
+    allocator.next_index = next_index;
 
     let mut data = Vec::with_capacity(PoolAllocator::SPACE);
     allocator.try_serialize(&mut data).unwrap();
@@ -874,13 +1279,7 @@ async fn create_squads_smart_account(
     seed: u128,
 ) -> Result<Pubkey, RpcError> {
     let squads_program_id = passkey_registry::SQUADS_SMART_ACCOUNT_PROGRAM_ID;
-    let (program_config, _) = Pubkey::find_program_address(
-        &[
-            passkey_registry::SQUADS_SEED_PREFIX,
-            SQUADS_PROGRAM_CONFIG_SEED,
-        ],
-        &squads_program_id,
-    );
+    let program_config = derive_squads_program_config();
     let (settings, _) = Pubkey::find_program_address(
         &[
             passkey_registry::SQUADS_SEED_PREFIX,
@@ -889,7 +1288,7 @@ async fn create_squads_smart_account(
         ],
         &squads_program_id,
     );
-    let treasury = Keypair::new().pubkey();
+    let treasury = squads_treasury();
     let previous_smart_account_index = seed
         .checked_sub(1)
         .ok_or_else(|| RpcError::CustomError("Squads smart account seed must start at 1".into()))?;
@@ -923,6 +1322,21 @@ async fn create_squads_smart_account(
         .await?;
 
     Ok(settings)
+}
+
+fn derive_squads_program_config() -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            passkey_registry::SQUADS_SEED_PREFIX,
+            SQUADS_PROGRAM_CONFIG_SEED,
+        ],
+        &passkey_registry::SQUADS_SMART_ACCOUNT_PROGRAM_ID,
+    )
+    .0
+}
+
+fn squads_treasury() -> Pubkey {
+    Pubkey::new_from_array(hash32(b"loyal-test-squads-treasury"))
 }
 
 async fn seed_squads_program_config(

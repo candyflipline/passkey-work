@@ -19,8 +19,15 @@ test-sbf = []
 
 [dependencies]
 anchor-lang = "0.31.1"
+light-account = { version = "0.23.0", features = ["anchor", "sha256"] }
+light-compressed-account = "0.11.0"
+light-hasher = "5.0.0"
 light-sdk = { version = "0.23.0", features = ["anchor", "v2", "cpi-context"] }
 light-sdk-types = { version = "0.23.0", features = ["v2", "cpi-context"] }
+solana-account-info = "2.2"
+solana-program = "2.3.0"
+solana-program-error = "2.2"
+solana-pubkey = "2.4.0"
 
 [dev-dependencies]
 light-program-test = "0.23.0"

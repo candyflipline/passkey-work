@@ -8,8 +8,9 @@ use anchor_lang::solana_program::{
     program::invoke_signed,
     sysvar::instructions::{load_current_index_checked, load_instruction_at_checked},
 };
+use light_account::{light_program, CompressionInfo, CreateAccountsProof, LightAccounts};
 use light_sdk::{
-    account::LightAccount,
+    account::LightAccount as CompressedLightAccount,
     address::v2::derive_address,
     cpi::{v2::CpiAccounts, CpiSigner},
     derive_light_cpi_signer,
@@ -39,15 +40,19 @@ pub const SQUADS_SEED_PREFIX: &[u8] = b"smart_account";
 pub const SQUADS_SEED_SMART_ACCOUNT: &[u8] = b"smart_account";
 pub const SQUADS_EXECUTE_TRANSACTION_SYNC_V2_DISCRIMINATOR: [u8; 8] =
     [90, 81, 187, 81, 39, 70, 128, 78];
+pub const SQUADS_CREATE_SMART_ACCOUNT_DISCRIMINATOR: [u8; 8] = [197, 102, 253, 231, 77, 84, 50, 17];
 pub const SQUADS_SETTINGS_DISCRIMINATOR: [u8; 8] = [223, 179, 163, 190, 177, 224, 67, 173];
 pub const SQUADS_FULL_PERMISSIONS_MASK: u8 = 7;
 pub const SQUADS_SYNC_SIGNER_COUNT: u8 = 1;
 pub const SQUADS_SEED_SETTINGS: &[u8] = b"settings";
+pub const SQUADS_PROGRAM_CONFIG_SEED: &[u8] = b"program_config";
+pub const SQUADS_ONE_SIGNER_SETTINGS_SPACE: usize = 168;
 
 // Light checks this program-authority PDA during CPI.
 pub const LIGHT_CPI_SIGNER: CpiSigner =
     derive_light_cpi_signer!("rTvZY3rX9PBXyWzHtMRnY92o7EiEFSwsYZKoCLxUY9X");
 
+#[light_program]
 #[program]
 pub mod passkey_registry {
     use super::*;
@@ -108,7 +113,7 @@ pub mod passkey_registry {
             &crate::ID,
         );
 
-        let mut authority_record = LightAccount::<PasskeyAuthority>::new_init(
+        let mut authority_record = CompressedLightAccount::<PasskeyAuthority>::new_init(
             &crate::ID,
             Some(address),
             output_state_tree_index,
@@ -136,8 +141,15 @@ pub mod passkey_registry {
         Ok(())
     }
 
-    pub fn initialize_pool_allocator(ctx: Context<InitializePoolAllocator>) -> Result<()> {
+    pub fn initialize_pool_allocator<'info>(
+        ctx: Context<'_, '_, '_, 'info, InitializePoolAllocator<'info>>,
+        params: InitializePoolAllocatorParams,
+    ) -> Result<()> {
         let squads_settings = ctx.accounts.squads_settings.key();
+        if params.squads_settings != squads_settings {
+            return err!(PasskeyRegistryError::InvalidSquadsSettings);
+        }
+
         let (verifier, _) = derive_verifier_pda();
         validate_squads_pool_settings(ctx.accounts.squads_settings.as_ref(), &verifier)?;
 
@@ -147,6 +159,52 @@ pub mod passkey_registry {
         allocator.status = POOL_ALLOCATOR_STATUS_ACTIVE;
         allocator.squads_settings = squads_settings;
         allocator.next_index = 0;
+        allocator.bump = ctx.bumps.pool_allocator;
+        allocator.withdraw_authority = params.withdraw_authority;
+
+        Ok(())
+    }
+
+    pub fn fund_pool_allocator(ctx: Context<FundPoolAllocator>, lamports: u64) -> Result<()> {
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.funder.to_account_info(),
+                    to: ctx.accounts.pool_allocator.to_account_info(),
+                },
+            ),
+            lamports,
+        )?;
+
+        Ok(())
+    }
+
+    pub fn withdraw_pool_allocator_surplus(
+        ctx: Context<WithdrawPoolAllocatorSurplus>,
+        lamports: u64,
+        minimum_lamports_to_keep: u64,
+    ) -> Result<()> {
+        if ctx.accounts.withdraw_authority.key() != ctx.accounts.pool_allocator.withdraw_authority {
+            return err!(PasskeyRegistryError::UnauthorizedPoolAllocatorWithdrawal);
+        }
+
+        let remaining = ctx
+            .accounts
+            .pool_allocator
+            .to_account_info()
+            .lamports()
+            .checked_sub(lamports)
+            .ok_or_else(|| error!(PasskeyRegistryError::InsufficientPoolAllocatorLamports))?;
+        if remaining < minimum_lamports_to_keep {
+            return err!(PasskeyRegistryError::InsufficientPoolAllocatorLamports);
+        }
+
+        transfer_lamports_from_owned_account(
+            &ctx.accounts.pool_allocator.to_account_info(),
+            &ctx.accounts.recipient.to_account_info(),
+            lamports,
+        )?;
 
         Ok(())
     }
@@ -180,7 +238,7 @@ pub mod passkey_registry {
 
         let (address, address_seed) =
             derive_address(&[POOL_DIRECTORY_SEED], &address_tree_pubkey, &crate::ID);
-        let mut pool_directory = LightAccount::<PoolDirectory>::new_init(
+        let mut pool_directory = CompressedLightAccount::<PoolDirectory>::new_init(
             &crate::ID,
             Some(address),
             output_state_tree_index,
@@ -199,35 +257,49 @@ pub mod passkey_registry {
         Ok(())
     }
 
-    pub fn advance_pool_directory<'info>(
-        ctx: Context<'_, '_, '_, 'info, AdvancePoolDirectory<'info>>,
-        proof: ValidityProof,
-        account_meta: CompressedAccountMeta,
-        expected_active_pool_index: u128,
-        current_directory: PoolDirectory,
+    pub fn provision_next_pool<'info>(
+        ctx: Context<'_, '_, '_, 'info, ProvisionNextPool<'info>>,
+        params: ProvisionNextPoolParams,
     ) -> Result<()> {
         // Rollover waits for all 256 vault indexes, so prepaid Squads capacity is never stranded.
         validate_current_pool_directory(
-            &current_directory,
-            &account_meta,
-            expected_active_pool_index,
+            &params.current_directory,
+            &params.directory_account_meta,
+            params.expected_active_pool_index,
         )?;
 
         validate_exhausted_pool_allocator(
             &ctx.accounts.current_pool_allocator,
-            current_directory.active_pool_index,
+            params.current_directory.active_pool_index,
         )?;
 
-        let next_pool_index = current_directory
+        let next_pool_index = params
+            .current_directory
             .active_pool_index
             .checked_add(1)
             .ok_or_else(|| error!(PasskeyRegistryError::PoolIndexOverflow))?;
         let (expected_next_settings, _) = derive_squads_settings(next_pool_index);
-        if ctx.accounts.new_squads_settings.key() != expected_next_settings {
+        if ctx.accounts.new_squads_settings.key() != expected_next_settings
+            || params.new_squads_settings != expected_next_settings
+        {
             return err!(PasskeyRegistryError::InvalidSquadsSettings);
         }
 
         let (verifier, _) = derive_verifier_pda();
+        prefund_squads_settings_for_create(
+            &ctx.accounts.current_pool_allocator.to_account_info(),
+            &ctx.accounts.new_squads_settings.to_account_info(),
+            ctx.accounts.program_config.as_ref(),
+        )?;
+        invoke_squads_create_smart_account(
+            &ctx.accounts.program_config,
+            &ctx.accounts.treasury,
+            &ctx.accounts.current_pool_allocator,
+            &ctx.accounts.system_program,
+            &ctx.accounts.squads_program,
+            &ctx.accounts.new_squads_settings,
+            &verifier,
+        )?;
         validate_squads_pool_settings(ctx.accounts.new_squads_settings.as_ref(), &verifier)?;
 
         let new_allocator = &mut ctx.accounts.new_pool_allocator;
@@ -235,17 +307,28 @@ pub mod passkey_registry {
         new_allocator.status = POOL_ALLOCATOR_STATUS_ACTIVE;
         new_allocator.squads_settings = ctx.accounts.new_squads_settings.key();
         new_allocator.next_index = 0;
+        new_allocator.bump = ctx.bumps.new_pool_allocator;
+        new_allocator.withdraw_authority = ctx.accounts.current_pool_allocator.withdraw_authority;
 
-        let mut pool_directory =
-            LightAccount::<PoolDirectory>::new_mut(&crate::ID, &account_meta, current_directory)?;
+        transfer_lamports_from_owned_account(
+            &ctx.accounts.current_pool_allocator.to_account_info(),
+            &ctx.accounts.new_pool_allocator.to_account_info(),
+            params.next_allocator_lamports,
+        )?;
+
+        let mut pool_directory = CompressedLightAccount::<PoolDirectory>::new_mut(
+            &crate::ID,
+            &params.directory_account_meta,
+            params.current_directory.clone(),
+        )?;
         pool_directory.active_pool_index = next_pool_index;
 
         let light_cpi_accounts = CpiAccounts::new(
-            ctx.accounts.payer.as_ref(),
+            ctx.accounts.fee_payer.as_ref(),
             ctx.remaining_accounts,
             crate::LIGHT_CPI_SIGNER,
         );
-        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, params.directory_proof)
             .with_light_account(pool_directory)?
             .invoke(light_cpi_accounts)?;
 
@@ -312,7 +395,7 @@ pub mod passkey_registry {
         )?;
 
         let account_index = current_authority.vault_index;
-        let mut authority_record = LightAccount::<PasskeyAuthority>::new_mut(
+        let mut authority_record = CompressedLightAccount::<PasskeyAuthority>::new_mut(
             &crate::ID,
             &account_meta,
             current_authority,
@@ -345,21 +428,73 @@ pub mod passkey_registry {
     }
 }
 
-#[derive(Accounts)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct InitializePoolAllocatorParams {
+    pub create_accounts_proof: CreateAccountsProof,
+    pub squads_settings: Pubkey,
+    pub withdraw_authority: Pubkey,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct ProvisionNextPoolParams {
+    pub create_accounts_proof: CreateAccountsProof,
+    pub directory_proof: ValidityProof,
+    pub directory_account_meta: CompressedAccountMeta,
+    pub expected_active_pool_index: u128,
+    pub current_directory: PoolDirectory,
+    pub new_squads_settings: Pubkey,
+    pub next_allocator_lamports: u64,
+}
+
+#[derive(Accounts, LightAccounts)]
+#[instruction(params: InitializePoolAllocatorParams)]
 pub struct InitializePoolAllocator<'info> {
     #[account(mut)]
-    pub payer: Signer<'info>,
+    pub fee_payer: Signer<'info>,
+    /// CHECK: Light validates the compression config PDA for this program.
+    pub compression_config: AccountInfo<'info>,
+    /// CHECK: Light validates the rent sponsor recorded in the compression config.
+    #[account(mut)]
+    pub pda_rent_sponsor: AccountInfo<'info>,
     /// CHECK: validated as a static Squads settings account before storing the pool.
     pub squads_settings: UncheckedAccount<'info>,
     #[account(
         init,
-        payer = payer,
-        space = PoolAllocator::SPACE,
-        seeds = [POOL_ALLOCATOR_SEED, squads_settings.key().as_ref()],
+        payer = fee_payer,
+        space = 8 + PoolAllocator::INIT_SPACE,
+        seeds = [POOL_ALLOCATOR_SEED, params.squads_settings.as_ref()],
         bump
+    )]
+    #[light_account(init)]
+    pub pool_allocator: Account<'info, PoolAllocator>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FundPoolAllocator<'info> {
+    #[account(mut)]
+    pub funder: Signer<'info>,
+    #[account(
+        mut,
+        constraint = pool_allocator.version == POOL_ALLOCATOR_VERSION,
+        constraint = pool_allocator.status == POOL_ALLOCATOR_STATUS_ACTIVE
     )]
     pub pool_allocator: Account<'info, PoolAllocator>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawPoolAllocatorSurplus<'info> {
+    pub withdraw_authority: Signer<'info>,
+    #[account(
+        mut,
+        constraint = pool_allocator.version == POOL_ALLOCATOR_VERSION,
+        constraint = pool_allocator.status == POOL_ALLOCATOR_STATUS_ACTIVE
+    )]
+    pub pool_allocator: Account<'info, PoolAllocator>,
+    /// CHECK: lamport recipient only.
+    #[account(mut)]
+    pub recipient: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -390,25 +525,43 @@ pub struct InitializePoolDirectory<'info> {
     pub squads_settings: UncheckedAccount<'info>,
 }
 
-#[derive(Accounts)]
-pub struct AdvancePoolDirectory<'info> {
+#[derive(Accounts, LightAccounts)]
+#[instruction(params: ProvisionNextPoolParams)]
+pub struct ProvisionNextPool<'info> {
     #[account(mut)]
-    pub payer: Signer<'info>,
+    pub fee_payer: Signer<'info>,
+    /// CHECK: Light validates the compression config PDA for this program.
+    pub compression_config: AccountInfo<'info>,
+    /// CHECK: Light validates the rent sponsor recorded in the compression config.
+    #[account(mut)]
+    pub pda_rent_sponsor: AccountInfo<'info>,
     #[account(
+        mut,
         constraint = current_pool_allocator.version == POOL_ALLOCATOR_VERSION,
         constraint = current_pool_allocator.status == POOL_ALLOCATOR_STATUS_ACTIVE
     )]
     pub current_pool_allocator: Account<'info, PoolAllocator>,
+    /// CHECK: validated as Squads' global config account by the Squads CPI.
+    #[account(mut)]
+    pub program_config: UncheckedAccount<'info>,
+    /// CHECK: validated against Squads program config by the Squads CPI.
+    #[account(mut)]
+    pub treasury: UncheckedAccount<'info>,
     /// CHECK: validated as the next deterministic Squads settings account.
+    #[account(mut)]
     pub new_squads_settings: UncheckedAccount<'info>,
     #[account(
         init,
-        payer = payer,
-        space = PoolAllocator::SPACE,
-        seeds = [POOL_ALLOCATOR_SEED, new_squads_settings.key().as_ref()],
+        payer = fee_payer,
+        space = 8 + PoolAllocator::INIT_SPACE,
+        seeds = [POOL_ALLOCATOR_SEED, params.new_squads_settings.as_ref()],
         bump
     )]
+    #[light_account(init)]
     pub new_pool_allocator: Account<'info, PoolAllocator>,
+    /// CHECK: constrained to the Squads smart account program id.
+    #[account(address = SQUADS_SMART_ACCOUNT_PROGRAM_ID)]
+    pub squads_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -430,18 +583,21 @@ pub struct ExecutePasskeyVaultTransaction<'info> {
     pub instructions: UncheckedAccount<'info>,
 }
 
-/// Hot, rent-paid state for the next vault index in one Squads settings pool.
+/// Hot Light-PDA state for the next vault index and rollover float in one Squads pool.
 #[account]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, InitSpace, light_account::LightAccount)]
 pub struct PoolAllocator {
+    pub compression_info: CompressionInfo,
     pub version: u8,
     pub status: u8,
     pub squads_settings: Pubkey,
     pub next_index: u16,
+    pub bump: u8,
+    pub withdraw_authority: Pubkey,
 }
 
 impl PoolAllocator {
-    pub const SPACE: usize = 8 + 1 + 1 + 32 + 2;
+    pub const SPACE: usize = 8 + Self::INIT_SPACE;
 
     pub fn next_vault_index(&self) -> Result<u8> {
         if self.next_index > u16::from(u8::MAX) {
@@ -745,6 +901,111 @@ fn validate_squads_pool_settings(
     Ok(())
 }
 
+fn transfer_lamports_from_owned_account(
+    source: &AccountInfo<'_>,
+    destination: &AccountInfo<'_>,
+    lamports: u64,
+) -> Result<()> {
+    let source_lamports = source.lamports();
+    if source_lamports < lamports {
+        return err!(PasskeyRegistryError::InsufficientPoolAllocatorLamports);
+    }
+
+    **source.try_borrow_mut_lamports()? = source_lamports
+        .checked_sub(lamports)
+        .ok_or_else(|| error!(PasskeyRegistryError::InsufficientPoolAllocatorLamports))?;
+    **destination.try_borrow_mut_lamports()? = destination
+        .lamports()
+        .checked_add(lamports)
+        .ok_or_else(|| error!(PasskeyRegistryError::InsufficientPoolAllocatorLamports))?;
+
+    Ok(())
+}
+
+fn prefund_squads_settings_for_create(
+    pool_allocator: &AccountInfo<'_>,
+    new_squads_settings: &AccountInfo<'_>,
+    program_config: &AccountInfo<'_>,
+) -> Result<()> {
+    let config_data = program_config
+        .try_borrow_data()
+        .map_err(|_| error!(PasskeyRegistryError::InvalidSquadsProgramConfig))?;
+    if config_data.len() < 8 {
+        return err!(PasskeyRegistryError::InvalidSquadsProgramConfig);
+    }
+    let mut config_data = &config_data[8..];
+    let config = SquadsProgramConfigView::deserialize(&mut config_data)
+        .map_err(|_| error!(PasskeyRegistryError::InvalidSquadsProgramConfig))?;
+    if config.smart_account_creation_fee != 0 {
+        return err!(PasskeyRegistryError::UnsupportedSquadsCreationFee);
+    }
+
+    let required_lamports = Rent::get()?.minimum_balance(SQUADS_ONE_SIGNER_SETTINGS_SPACE);
+    let top_up = required_lamports.saturating_sub(new_squads_settings.lamports());
+    if top_up > 0 {
+        transfer_lamports_from_owned_account(pool_allocator, new_squads_settings, top_up)?;
+    }
+
+    Ok(())
+}
+
+fn invoke_squads_create_smart_account<'info>(
+    program_config: &UncheckedAccount<'info>,
+    treasury: &UncheckedAccount<'info>,
+    creator: &Account<'info, PoolAllocator>,
+    system_program: &Program<'info, System>,
+    squads_program: &UncheckedAccount<'info>,
+    settings: &UncheckedAccount<'info>,
+    verifier: &Pubkey,
+) -> Result<()> {
+    let args = SquadsCreateSmartAccountArgs {
+        settings_authority: None,
+        threshold: 1,
+        signers: vec![SquadsSmartAccountSignerArgs {
+            key: *verifier,
+            permissions: SquadsPermissionsView {
+                mask: SQUADS_FULL_PERMISSIONS_MASK,
+            },
+        }],
+        time_lock: 0,
+        rent_collector: None,
+        memo: None,
+    };
+    let mut data = Vec::from(SQUADS_CREATE_SMART_ACCOUNT_DISCRIMINATOR);
+    args.serialize(&mut data)
+        .map_err(|_| error!(PasskeyRegistryError::InvalidSquadsCreatePayload))?;
+
+    let instruction = Instruction {
+        program_id: squads_program.key(),
+        accounts: vec![
+            AccountMeta::new(program_config.key(), false),
+            AccountMeta::new(treasury.key(), false),
+            AccountMeta::new(creator.key(), true),
+            AccountMeta::new_readonly(system_program.key(), false),
+            AccountMeta::new_readonly(squads_program.key(), false),
+            AccountMeta::new(settings.key(), false),
+        ],
+        data,
+    };
+    let account_infos = [
+        program_config.to_account_info(),
+        treasury.to_account_info(),
+        creator.to_account_info(),
+        system_program.to_account_info(),
+        squads_program.to_account_info(),
+        settings.to_account_info(),
+    ];
+    let allocator_bump = [creator.bump];
+    let signer_seeds: &[&[u8]] = &[
+        POOL_ALLOCATOR_SEED,
+        creator.squads_settings.as_ref(),
+        &allocator_bump,
+    ];
+    invoke_signed(&instruction, &account_infos, &[signer_seeds])?;
+
+    Ok(())
+}
+
 fn invoke_squads_sync_transaction<'info>(
     squads_settings: &UncheckedAccount<'info>,
     squads_program: &UncheckedAccount<'info>,
@@ -899,6 +1160,22 @@ pub struct SquadsSyncTransactionArgs {
     pub payload: SquadsSyncPayload,
 }
 
+#[derive(AnchorSerialize, Clone, Debug)]
+pub struct SquadsCreateSmartAccountArgs {
+    pub settings_authority: Option<Pubkey>,
+    pub threshold: u16,
+    pub signers: Vec<SquadsSmartAccountSignerArgs>,
+    pub time_lock: u32,
+    pub rent_collector: Option<Pubkey>,
+    pub memo: Option<String>,
+}
+
+#[derive(AnchorSerialize, Clone, Debug)]
+pub struct SquadsSmartAccountSignerArgs {
+    pub key: Pubkey,
+    pub permissions: SquadsPermissionsView,
+}
+
 #[derive(AnchorDeserialize)]
 struct SquadsSettingsView {
     _seed: u128,
@@ -923,7 +1200,16 @@ struct SquadsSmartAccountSignerView {
 }
 
 #[derive(AnchorDeserialize)]
-struct SquadsPermissionsView {
+struct SquadsProgramConfigView {
+    _smart_account_index: u128,
+    _authority: Pubkey,
+    smart_account_creation_fee: u64,
+    _treasury: Pubkey,
+    _reserved: [u8; 64],
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct SquadsPermissionsView {
     mask: u8,
 }
 
@@ -971,6 +1257,16 @@ pub enum PasskeyRegistryError {
     InvalidRemainingAccountsSplit,
     #[msg("The Squads synchronous transaction payload could not be serialized")]
     InvalidSquadsSyncPayload,
+    #[msg("The Squads smart account creation payload could not be serialized")]
+    InvalidSquadsCreatePayload,
+    #[msg("The Squads program config account could not be read")]
+    InvalidSquadsProgramConfig,
+    #[msg("The pooled Squads creation path requires a zero Squads creation fee")]
+    UnsupportedSquadsCreationFee,
+    #[msg("The signer is not allowed to withdraw allocator surplus")]
+    UnauthorizedPoolAllocatorWithdrawal,
+    #[msg("The pool allocator does not have enough lamports")]
+    InsufficientPoolAllocatorLamports,
     #[msg("The secp256r1 verification instruction must precede the registry instruction")]
     Secp256r1InstructionMustPrecedeRegistry,
 }

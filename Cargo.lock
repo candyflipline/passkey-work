@@ -2606,6 +2606,7 @@ version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec4f3acf8345ca221e4c7a7d277924ca52daea0dea5d5cf8c8f0951a3cad60dc"
 dependencies = [
+ "anchor-lang",
  "light-account-checks",
  "light-compressed-account",
  "light-compressible",
@@ -3722,12 +3723,19 @@ name = "passkey-registry"
 version = "0.1.0"
 dependencies = [
  "anchor-lang",
+ "light-account",
  "light-client",
+ "light-compressed-account",
+ "light-hasher",
  "light-program-test",
  "light-sdk",
  "light-sdk-types",
  "litesvm",
  "openssl",
+ "solana-account-info",
+ "solana-program",
+ "solana-program-error",
+ "solana-pubkey",
  "solana-sdk",
  "solana-secp256r1-program",
  "tokio",
