@@ -256,6 +256,121 @@ async fn creates_wallet_authority_compressed_pda() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn shared_pool_allocator_prevents_wallet_and_passkey_vault_collisions() {
+    let _guard = LIGHT_PROGRAM_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    install_light_cli_shim();
+
+    let config = ProgramTestConfig::new_v2(
+        true,
+        Some(vec![
+            ("passkey_registry", passkey_registry::ID),
+            (
+                SQUADS_SMART_ACCOUNT_PROGRAM_NAME,
+                passkey_registry::SQUADS_SMART_ACCOUNT_PROGRAM_ID,
+            ),
+        ]),
+    );
+    let mut rpc = LightProgramTest::new(config).await.unwrap();
+    let payer = rpc.get_payer().insecure_clone();
+    let wallet = Keypair::new();
+    let passkey_authority = prf_derived_authority();
+    let (verifier, _) = passkey_registry::derive_verifier_pda();
+    let squads_settings = create_squads_smart_account(&mut rpc, &payer, verifier, 1)
+        .await
+        .unwrap();
+    let (pool_allocator, _) = Pubkey::find_program_address(
+        &[POOL_ALLOCATOR_SEED, squads_settings.as_ref()],
+        &passkey_registry::ID,
+    );
+
+    rpc.airdrop_lamports(&wallet.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
+    rpc.airdrop_lamports(&passkey_authority.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
+    initialize_pool_allocator(&mut rpc, &payer, pool_allocator, squads_settings)
+        .await
+        .unwrap();
+
+    let address_tree_info = rpc.get_address_tree_v2();
+    let credential_id_hash = hash32(b"loyal-test-shared-allocator-passkey");
+    let (passkey_address, _) = derive_address(
+        &[PASSKEY_AUTHORITY_SEED, credential_id_hash.as_ref()],
+        &address_tree_info.tree,
+        &passkey_registry::ID,
+    );
+
+    let (stale_passkey_pubkey, stale_vault_zero_assertion) = create_passkey_signature_instruction(
+        &credential_id_hash,
+        &passkey_authority.pubkey(),
+        &address_tree_info.tree,
+        &squads_settings,
+        0,
+    );
+
+    let wallet_hash = wallet_authority_hash(&wallet.pubkey());
+    let (wallet_address, _) =
+        derive_wallet_authority_address(&wallet_hash, &address_tree_info.tree);
+    create_wallet_authority(&mut rpc, &payer, &wallet, pool_allocator, &wallet_address)
+        .await
+        .unwrap();
+
+    let wallet_record = fetch_passkey_authority(&rpc, wallet_address).await;
+    assert_eq!(wallet_record.authority_kind, AUTHORITY_KIND_WALLET);
+    assert_eq!(wallet_record.vault_index, 0);
+
+    assert!(create_passkey_authority(
+        &mut rpc,
+        &payer,
+        &passkey_authority,
+        pool_allocator,
+        &passkey_address,
+        stale_vault_zero_assertion,
+        credential_id_hash,
+        stale_passkey_pubkey,
+    )
+    .await
+    .is_err());
+
+    let allocator_account = rpc.get_account(pool_allocator).await.unwrap().unwrap();
+    let allocator = PoolAllocator::try_deserialize(&mut allocator_account.data.as_slice()).unwrap();
+    assert_eq!(allocator.next_index, 1);
+
+    let (fresh_passkey_pubkey, fresh_vault_one_assertion) = create_passkey_signature_instruction(
+        &credential_id_hash,
+        &passkey_authority.pubkey(),
+        &address_tree_info.tree,
+        &squads_settings,
+        1,
+    );
+
+    create_passkey_authority(
+        &mut rpc,
+        &payer,
+        &passkey_authority,
+        pool_allocator,
+        &passkey_address,
+        fresh_vault_one_assertion,
+        credential_id_hash,
+        fresh_passkey_pubkey,
+    )
+    .await
+    .unwrap();
+
+    let passkey_record = fetch_passkey_authority(&rpc, passkey_address).await;
+    assert_eq!(passkey_record.authority_kind, AUTHORITY_KIND_PASSKEY);
+    assert_eq!(passkey_record.vault_index, 1);
+    assert_eq!(passkey_record.squads_settings, squads_settings);
+
+    let allocator_account = rpc.get_account(pool_allocator).await.unwrap().unwrap();
+    let allocator = PoolAllocator::try_deserialize(&mut allocator_account.data.as_slice()).unwrap();
+    assert_eq!(allocator.next_index, 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn pool_allocator_can_hold_and_withdraw_rollover_float() {
     let _guard = LIGHT_PROGRAM_TEST_LOCK
         .lock()

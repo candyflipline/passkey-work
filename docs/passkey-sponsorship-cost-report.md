@@ -1,6 +1,6 @@
 # Passkey and Smart-Account Sponsorship Cost Report
 
-This report compares the rent reserve needed to onboard 256 users with a direct one-user-one-account model versus the current compressed PDA plus pooled Squads smart-account model. The compressed authority record supports both passkey users and regular Ed25519 wallet signers.
+This report compares the rent reserve needed to sponsor one-signer smart accounts versus the current compressed PDA plus pooled Squads smart-account model. The 10,000-user simulation uses a direct baseline of one Squads smart account per user with one Ed25519 signer. It also includes a sensitivity case for the older direct model where each user gets both a normal authority PDA and a Squads settings account.
 
 ## Scope
 
@@ -40,6 +40,38 @@ total data: 141 bytes
 ```
 
 The Squads settings estimate follows the local Squads smart-account program used by the SBF test. With one verifier signer, `Settings::size(1)` is 168 bytes. The current pooled route also creates one Light-PDA `PoolAllocator` for the whole Squads settings pool and one compressed `PoolDirectory` cursor for discovering the active pool.
+
+## 10,000 User Simulation
+
+The simulation lives at `scripts/simulate-sponsorship-costs.mjs` and was run with:
+
+```text
+node scripts/simulate-sponsorship-costs.mjs
+```
+
+Inputs:
+
+| Input | Value |
+| --- | ---: |
+| Requested users | 10,000 |
+| Vault slots per pooled Squads settings account | 256 |
+| Pooled settings accounts needed | 40 |
+| Pooled smart-account capacity created | 10,240 |
+| Unused slots in final pool | 240 |
+
+Results:
+
+| Route | Sponsored account shape | Total rent reserve |
+| --- | --- | ---: |
+| Direct one-signer smart accounts | 10,000 Squads settings accounts, each with one Ed25519 signer | 20,601,600,000 lamports / 20.6016 SOL |
+| Current pooled route | 10,000 compressed authority records + 40 Squads settings accounts + 40 allocator Light PDAs + 1 compressed directory cursor | 146,160,000 lamports / 0.14616 SOL |
+| Direct route with normal authority PDAs | 10,000 normal authority PDAs + 10,000 Squads settings accounts | 39,880,800,000 lamports / 39.8808 SOL |
+
+The pooled route cuts rent by about 141.0x compared with sponsoring 10,000 direct one-signer Squads smart accounts. It leaves 20.45544 SOL unlocked, a 99.29% rent-reserve reduction.
+
+Against the direct route that also stores one normal authority PDA per user, the same pooled design cuts rent by about 272.9x. It leaves 39.73464 SOL unlocked, a 99.63% rent-reserve reduction.
+
+For the requested 10,000 users, the pooled route amortizes to 14,616 lamports, or 0.000014616 SOL, per requested user. Across the 10,240 vault slots created by the 40 pools, the reserve is 14,273.4375 lamports, or 0.0000142734375 SOL, per available slot.
 
 ## 256 User Comparison
 
