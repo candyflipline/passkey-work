@@ -1,4 +1,4 @@
-import { deriveAddress, deriveAddressSeed } from "@lightprotocol/stateless.js/browser";
+import { deriveAddress, deriveAddressSeed } from "@lightprotocol/stateless.js";
 import { PublicKey } from "@solana/web3.js";
 import {
   LIGHT_ADDRESS_TREE_V2,
@@ -13,7 +13,7 @@ import {
   SQUADS_SMART_ACCOUNT_PROGRAM_ID,
   VERIFIER_SEED,
   WALLET_AUTHORITY_DOMAIN,
-} from "./constants";
+} from "./constants.js";
 import {
   fixedBytes,
   hashv,
@@ -22,7 +22,7 @@ import {
   readU64Le,
   utf8,
   type BytesLike,
-} from "./bytes";
+} from "./bytes.js";
 
 export type CompressedP256PublicKey = {
   prefix: number;

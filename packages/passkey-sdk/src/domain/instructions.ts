@@ -11,11 +11,16 @@ import {
   PASSKEY_REGISTRY_PROGRAM_ID,
   SECP256R1_PROGRAM_ID,
   SQUADS_SMART_ACCOUNT_PROGRAM_ID,
-} from "./constants";
-import { bytes, fixedBytes, type BytesLike } from "./bytes";
-import { compressedP256PublicKeyBytes } from "./challenges";
-import { deriveVerifierPda } from "./addresses";
-import { webauthnSignedMessage, type PasskeyAssertion } from "./webauthn";
+} from "./constants.js";
+import { bytes, concatBytes, fixedBytes, sha256, type BytesLike } from "./bytes.js";
+import { compressedP256PublicKeyBytes } from "./challenges.js";
+import { deriveVerifierPda } from "./addresses.js";
+
+export type PasskeyAssertionInput = {
+  authenticatorData: BytesLike;
+  clientDataJson: BytesLike;
+  signature: BytesLike;
+};
 
 function encodeInstruction(name: string, args: Record<string, unknown>) {
   return new BorshInstructionCoder(passkeyRegistryIdl).encode(name, args);
@@ -34,7 +39,7 @@ export type CreatePasskeyAuthorityInstructionArgs = {
     prefix: number;
     x: BytesLike;
   };
-  assertion: Pick<PasskeyAssertion, "authenticatorData" | "clientDataJson">;
+  assertion: Pick<PasskeyAssertionInput, "authenticatorData" | "clientDataJson">;
 };
 
 export type CreateWalletAuthorityInstructionArgs = {
@@ -58,7 +63,7 @@ export type ExecutePasskeyVaultTransactionInstructionArgs = {
   expiresAtUnixTimestamp: bigint | number;
   currentAuthority: unknown;
   squadsPayload: BytesLike;
-  assertion: Pick<PasskeyAssertion, "authenticatorData" | "clientDataJson">;
+  assertion: Pick<PasskeyAssertionInput, "authenticatorData" | "clientDataJson">;
 };
 
 export type ExecuteWalletVaultTransactionInstructionArgs = {
@@ -117,13 +122,20 @@ export async function createPasskeySecp256r1Instruction({
   assertion,
 }: {
   passkeyPublicKey: { prefix: number; x: BytesLike };
-  assertion: Pick<PasskeyAssertion, "authenticatorData" | "clientDataJson" | "signature">;
+  assertion: PasskeyAssertionInput;
 }) {
   return createSecp256r1Instruction({
     publicKey: compressedP256PublicKeyBytes(passkeyPublicKey),
     signature: assertion.signature,
     message: await webauthnSignedMessage(assertion),
   });
+}
+
+async function webauthnSignedMessage({
+  authenticatorData,
+  clientDataJson,
+}: Pick<PasskeyAssertionInput, "authenticatorData" | "clientDataJson">) {
+  return concatBytes([bytes(authenticatorData), await sha256(clientDataJson)]);
 }
 
 export function createPasskeyAuthorityInstruction(args: CreatePasskeyAuthorityInstructionArgs) {
@@ -143,8 +155,8 @@ export function createPasskeyAuthorityInstruction(args: CreatePasskeyAuthorityIn
       credentialIdHash: Array.from(fixedBytes(args.credentialIdHash, 32, "credentialIdHash")),
       passkeyPubkeyPrefix: args.passkeyPublicKey.prefix,
       passkeyPubkeyX: Array.from(fixedBytes(args.passkeyPublicKey.x, 32, "passkeyPublicKey.x")),
-      authenticatorData: Buffer.from(args.assertion.authenticatorData),
-      clientDataJson: Buffer.from(args.assertion.clientDataJson),
+      authenticatorData: Buffer.from(bytes(args.assertion.authenticatorData)),
+      clientDataJson: Buffer.from(bytes(args.assertion.clientDataJson)),
     }),
   });
 }
@@ -190,8 +202,8 @@ export function createExecutePasskeyVaultTransactionInstruction(
       expiresAtUnixTimestamp: new BN(args.expiresAtUnixTimestamp.toString()),
       currentAuthority: args.currentAuthority,
       squadsPayload: Buffer.from(bytes(args.squadsPayload)),
-      authenticatorData: Buffer.from(args.assertion.authenticatorData),
-      clientDataJson: Buffer.from(args.assertion.clientDataJson),
+      authenticatorData: Buffer.from(bytes(args.assertion.authenticatorData)),
+      clientDataJson: Buffer.from(bytes(args.assertion.clientDataJson)),
     }),
   });
 }

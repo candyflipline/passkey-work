@@ -8,8 +8,8 @@ import {
   sha256,
   utf8,
   type BytesLike,
-} from "./bytes";
-import type { CompressedP256PublicKey } from "./addresses";
+} from "./bytes.js";
+import type { CompressedP256PublicKey } from "./addresses.js";
 
 type PrfCreationResults = AuthenticationExtensionsClientOutputs & {
   prf?: {

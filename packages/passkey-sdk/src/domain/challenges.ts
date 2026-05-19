@@ -4,7 +4,7 @@ import {
   PASSKEY_REGISTRY_PROGRAM_ID,
   REGISTRATION_DOMAIN,
   SQUADS_SMART_ACCOUNT_PROGRAM_ID,
-} from "./constants";
+} from "./constants.js";
 import {
   concatBytes,
   fixedBytes,
@@ -14,8 +14,8 @@ import {
   publicKeyBytes,
   utf8,
   type BytesLike,
-} from "./bytes";
-import { deriveVerifierPda } from "./addresses";
+} from "./bytes.js";
+import { deriveVerifierPda } from "./addresses.js";
 
 export function compressedP256PublicKeyBytes({
   prefix,

@@ -4,9 +4,13 @@
   "private": true,
   "type": "module",
   "packageManager": "bun@1.3.11",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "sdk:build": "bun run --cwd packages/passkey-sdk build",
     "start": "next start",
     "lint": "eslint",
     "anchor:build": "NO_DNA=1 anchor build",
@@ -21,6 +25,7 @@
     "@coral-xyz/anchor": "^0.31.1",
     "@lightprotocol/compressed-token": "^0.23.3",
     "@lightprotocol/stateless.js": "^0.23.3",
+    "@loyal/passkey-sdk": "workspace:*",
     "@solana/web3.js": "^1.98.0",
     "bn.js": "^5.2.1",
     "next": "16.2.6",

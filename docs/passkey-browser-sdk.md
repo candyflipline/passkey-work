@@ -1,6 +1,33 @@
-# Passkey Browser SDK
+# Passkey SDK
 
-The browser SDK lives in `src/features/passkey-smart-account`. It packages the pieces the web app needs to integrate with the registry and pooled Squads vault flow: WebAuthn passkey creation, P-256 public-key extraction, PRF evaluation for the Ed25519 Solana authority seed, registration and execution challenge builders, PDA derivation, `secp256r1` precompile instruction packing, registry instruction packing, wallet-authority instruction packing, and immutable transaction-plan helpers for user-paid or backend-sponsored transactions.
+The SDK lives in `packages/passkey-sdk` and is published as `@loyal/passkey-sdk`. It packages the pieces the web app and sponsor backend need to integrate with the registry and pooled Squads vault flow: WebAuthn passkey creation, P-256 public-key extraction, PRF evaluation for the Ed25519 Solana authority seed, registration and execution challenge builders, PDA derivation, `secp256r1` precompile instruction packing, registry instruction packing, wallet-authority instruction packing, and immutable transaction-plan helpers for user-paid or backend-sponsored transactions.
+
+Use the core entrypoint on servers:
+
+```ts
+import {
+  createWalletAuthorityInstruction,
+  deriveWalletAuthorityAddress,
+  walletAuthorityHash,
+} from "@loyal/passkey-sdk";
+```
+
+Use the browser entrypoint when WebAuthn helpers are needed:
+
+```ts
+import {
+  createPasskeyCredential,
+  derivePrfAuthority,
+  getPasskeyAssertion,
+} from "@loyal/passkey-sdk/browser";
+```
+
+Build the package before packing or publishing:
+
+```bash
+bun run sdk:build
+npm pack ./packages/passkey-sdk --pack-destination /tmp
+```
 
 ## Data Flow
 
@@ -50,3 +77,11 @@ const transaction = buildUnsignedSponsoredTransaction({
 ```
 
 Before broadcasting, the backend should simulate the transaction, confirm the requested Squads payload and accounts are policy-acceptable, then add its fee-payer signature.
+
+## Package Layout
+
+`@loyal/passkey-sdk` exports server-safe helpers from `src/index.ts`. That surface covers address derivation, challenge construction, instruction builders, wallet authority helpers, registry constants, and transaction plan builders.
+
+`@loyal/passkey-sdk/browser` exports the same core helpers plus the browser-only WebAuthn functions from `src/browser.ts`. Browser-only functions should not be imported by backend code.
+
+The package `prepack` script builds `dist` so the tarball contains JavaScript and type declarations. Generated `dist` files are ignored in git.
