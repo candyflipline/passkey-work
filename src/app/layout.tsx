@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Loyal Passkey PRF Tester",
-  description: "Create and inspect passkeys with the WebAuthn PRF extension.",
+  title: "Loyal Passkey Demo",
+  description: "Passkey and wallet account integration demo.",
 };
 
 export default function RootLayout({

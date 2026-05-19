@@ -8,8 +8,8 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "bun run sdk:build && next dev",
+    "build": "bun run sdk:build && next build",
     "sdk:build": "bun run --cwd packages/passkey-sdk build",
     "start": "next start",
     "lint": "eslint",
@@ -26,7 +26,10 @@
     "@lightprotocol/compressed-token": "^0.23.3",
     "@lightprotocol/stateless.js": "^0.23.3",
     "@loyal/passkey-sdk": "workspace:*",
+    "@solana/kit": "^6.9.0",
     "@solana/web3.js": "^1.98.0",
+    "@wallet-standard/core": "^1.1.1",
+    "@wallet-standard/react": "^1.0.2",
     "bn.js": "^5.2.1",
     "next": "16.2.6",
     "react": "19.2.4",

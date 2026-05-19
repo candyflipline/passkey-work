@@ -1,5 +1,5 @@
-import { PasskeyPrfTester } from "@/features/passkey-prf";
+import { PasskeyIntegrationDemo } from "@/features/passkey-integration-demo";
 
 export default function Home() {
-  return <PasskeyPrfTester />;
+  return <PasskeyIntegrationDemo />;
 }

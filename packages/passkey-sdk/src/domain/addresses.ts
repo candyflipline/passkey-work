@@ -77,10 +77,10 @@ export function derivePasskeyAuthorityAddress(
   credentialIdHash: BytesLike,
   addressTree: PublicKey | string = LIGHT_ADDRESS_TREE_V2,
 ) {
-  const seed = deriveAddressSeed(
-    [utf8(PASSKEY_AUTHORITY_SEED), fixedBytes(credentialIdHash, 32, "credentialIdHash")],
-    PASSKEY_REGISTRY_PROGRAM_ID,
-  );
+  const seed = deriveAddressSeed([
+    utf8(PASSKEY_AUTHORITY_SEED),
+    fixedBytes(credentialIdHash, 32, "credentialIdHash"),
+  ]);
 
   return deriveAddress(seed, new PublicKey(addressTree), PASSKEY_REGISTRY_PROGRAM_ID);
 }
@@ -89,14 +89,11 @@ export function deriveWalletAuthorityAddress(
   walletAuthorityHash: BytesLike,
   addressTree: PublicKey | string = LIGHT_ADDRESS_TREE_V2,
 ) {
-  const seed = deriveAddressSeed(
-    [
-      utf8(PASSKEY_AUTHORITY_SEED),
-      utf8(WALLET_AUTHORITY_DOMAIN),
-      fixedBytes(walletAuthorityHash, 32, "walletAuthorityHash"),
-    ],
-    PASSKEY_REGISTRY_PROGRAM_ID,
-  );
+  const seed = deriveAddressSeed([
+    utf8(PASSKEY_AUTHORITY_SEED),
+    utf8(WALLET_AUTHORITY_DOMAIN),
+    fixedBytes(walletAuthorityHash, 32, "walletAuthorityHash"),
+  ]);
 
   return deriveAddress(seed, new PublicKey(addressTree), PASSKEY_REGISTRY_PROGRAM_ID);
 }
@@ -106,7 +103,7 @@ export async function walletAuthorityHash(authority: PublicKey | string) {
 }
 
 export function derivePoolDirectoryAddress(addressTree: PublicKey | string = LIGHT_ADDRESS_TREE_V2) {
-  const seed = deriveAddressSeed([utf8(POOL_DIRECTORY_SEED)], PASSKEY_REGISTRY_PROGRAM_ID);
+  const seed = deriveAddressSeed([utf8(POOL_DIRECTORY_SEED)]);
 
   return deriveAddress(seed, new PublicKey(addressTree), PASSKEY_REGISTRY_PROGRAM_ID);
 }
