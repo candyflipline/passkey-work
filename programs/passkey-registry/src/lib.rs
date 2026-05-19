@@ -11,7 +11,7 @@ use anchor_lang::solana_program::{
 use light_account::{light_program, CompressionInfo, CreateAccountsProof, LightAccounts};
 use light_sdk::{
     account::LightAccount as CompressedLightAccount,
-    address::v2::derive_address,
+    address::{v2::derive_address, AddressSeed},
     cpi::{v2::CpiAccounts, CpiSigner},
     derive_light_cpi_signer,
     instruction::{account_meta::CompressedAccountMeta, PackedAddressTreeInfo, ValidityProof},
@@ -21,9 +21,12 @@ use light_sdk_types::ADDRESS_TREE_V2;
 
 declare_id!("rTvZY3rX9PBXyWzHtMRnY92o7EiEFSwsYZKoCLxUY9X");
 
-pub const PASSKEY_AUTHORITY_VERSION: u8 = 2;
+pub const PASSKEY_AUTHORITY_VERSION: u8 = 3;
 pub const PASSKEY_AUTHORITY_STATUS_ACTIVE: u8 = 1;
+pub const AUTHORITY_KIND_PASSKEY: u8 = 1;
+pub const AUTHORITY_KIND_WALLET: u8 = 2;
 pub const PASSKEY_AUTHORITY_SEED: &[u8] = b"passkey-authority";
+pub const WALLET_AUTHORITY_DOMAIN: &[u8] = b"LOYAL_WALLET_AUTHORITY_V1";
 pub const POOL_ALLOCATOR_VERSION: u8 = 1;
 pub const POOL_ALLOCATOR_STATUS_ACTIVE: u8 = 1;
 pub const POOL_ALLOCATOR_SEED: &[u8] = b"pool-allocator";
@@ -127,6 +130,7 @@ pub mod passkey_registry {
         );
         authority_record.version = PASSKEY_AUTHORITY_VERSION;
         authority_record.status = PASSKEY_AUTHORITY_STATUS_ACTIVE;
+        authority_record.authority_kind = AUTHORITY_KIND_PASSKEY;
         authority_record.credential_id_hash = credential_id_hash;
         authority_record.passkey_pubkey_prefix = passkey_pubkey_prefix;
         authority_record.passkey_pubkey_x = passkey_pubkey_x;
@@ -136,6 +140,60 @@ pub mod passkey_registry {
         authority_record.nonce = 0;
 
         // CPI atomicity.
+        ctx.accounts.pool_allocator.allocate_next(vault_index)?;
+
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(authority_record)?
+            .with_new_addresses(&[
+                address_tree_info.into_new_address_params_assigned_packed(address_seed, Some(0))
+            ])
+            .invoke(light_cpi_accounts)?;
+
+        Ok(())
+    }
+
+    pub fn create_wallet_authority<'info>(
+        ctx: Context<'_, '_, '_, 'info, CreateWalletAuthority<'info>>,
+        proof: ValidityProof,
+        address_tree_info: PackedAddressTreeInfo,
+        output_state_tree_index: u8,
+    ) -> Result<()> {
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.authority.as_ref(),
+            ctx.remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+
+        let address_tree_pubkey = address_tree_info
+            .get_tree_pubkey(&light_cpi_accounts)
+            .map_err(|_| error!(PasskeyRegistryError::InvalidAddressTree))?;
+
+        if address_tree_pubkey.to_bytes() != ADDRESS_TREE_V2 {
+            return err!(PasskeyRegistryError::InvalidAddressTree);
+        }
+
+        let squads_settings = ctx.accounts.pool_allocator.squads_settings;
+        let vault_index = ctx.accounts.pool_allocator.next_vault_index()?;
+        let wallet_authority_hash = wallet_authority_hash(&ctx.accounts.authority.key());
+        let (address, address_seed) =
+            derive_wallet_authority_address(&wallet_authority_hash, &address_tree_pubkey);
+
+        let mut authority_record = CompressedLightAccount::<PasskeyAuthority>::new_init(
+            &crate::ID,
+            Some(address),
+            output_state_tree_index,
+        );
+        authority_record.version = PASSKEY_AUTHORITY_VERSION;
+        authority_record.status = PASSKEY_AUTHORITY_STATUS_ACTIVE;
+        authority_record.authority_kind = AUTHORITY_KIND_WALLET;
+        authority_record.credential_id_hash = wallet_authority_hash;
+        authority_record.passkey_pubkey_prefix = 0;
+        authority_record.passkey_pubkey_x = [0; 32];
+        authority_record.ed25519_authority = ctx.accounts.authority.key();
+        authority_record.squads_settings = squads_settings;
+        authority_record.vault_index = vault_index;
+        authority_record.nonce = 0;
+
         ctx.accounts.pool_allocator.allocate_next(vault_index)?;
 
         LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
@@ -370,6 +428,7 @@ pub mod passkey_registry {
             &account_meta,
             &ctx.accounts.squads_settings.key(),
             expected_nonce,
+            AUTHORITY_KIND_PASSKEY,
         )?;
         validate_squads_pool_settings(
             ctx.accounts.squads_settings.as_ref(),
@@ -403,6 +462,68 @@ pub mod passkey_registry {
             &execution_challenge,
             &authenticator_data,
             &client_data_json,
+        )?;
+
+        let account_index = current_authority.vault_index;
+        let mut authority_record = CompressedLightAccount::<PasskeyAuthority>::new_mut(
+            &crate::ID,
+            &account_meta,
+            current_authority,
+        )?;
+        authority_record.nonce = authority_record
+            .nonce
+            .checked_add(1)
+            .ok_or_else(|| error!(PasskeyRegistryError::NonceOverflow))?;
+
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.payer.as_ref(),
+            light_remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(authority_record)?
+            .invoke(light_cpi_accounts)?;
+
+        invoke_squads_sync_transaction(
+            &ctx.accounts.squads_settings,
+            &ctx.accounts.squads_program,
+            &ctx.accounts.verifier,
+            squads_instruction_accounts,
+            account_index,
+            squads_payload,
+            ctx.bumps.verifier,
+        )?;
+
+        Ok(())
+    }
+
+    pub fn execute_wallet_vault_transaction<'info>(
+        ctx: Context<'_, '_, '_, 'info, ExecuteWalletVaultTransaction<'info>>,
+        proof: ValidityProof,
+        account_meta: CompressedAccountMeta,
+        light_remaining_accounts_count: u8,
+        expected_nonce: u64,
+        current_authority: PasskeyAuthority,
+        squads_payload: Vec<u8>,
+    ) -> Result<()> {
+        let (light_remaining_accounts, squads_instruction_accounts) = ctx
+            .remaining_accounts
+            .split_at_checked(usize::from(light_remaining_accounts_count))
+            .ok_or_else(|| error!(PasskeyRegistryError::InvalidRemainingAccountsSplit))?;
+
+        validate_current_authority(
+            &current_authority,
+            &account_meta,
+            &ctx.accounts.squads_settings.key(),
+            expected_nonce,
+            AUTHORITY_KIND_WALLET,
+        )?;
+        if current_authority.ed25519_authority != ctx.accounts.authority.key() {
+            return err!(PasskeyRegistryError::UnauthorizedWalletAuthority);
+        }
+        validate_squads_pool_settings(
+            ctx.accounts.squads_settings.as_ref(),
+            &ctx.accounts.verifier.key(),
         )?;
 
         let account_index = current_authority.vault_index;
@@ -524,6 +645,18 @@ pub struct CreatePasskeyAuthority<'info> {
 }
 
 #[derive(Accounts)]
+pub struct CreateWalletAuthority<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        constraint = pool_allocator.version == POOL_ALLOCATOR_VERSION,
+        constraint = pool_allocator.status == POOL_ALLOCATOR_STATUS_ACTIVE
+    )]
+    pub pool_allocator: Account<'info, PoolAllocator>,
+}
+
+#[derive(Accounts)]
 pub struct InitializePoolDirectory<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -594,6 +727,22 @@ pub struct ExecutePasskeyVaultTransaction<'info> {
     pub instructions: UncheckedAccount<'info>,
 }
 
+#[derive(Accounts)]
+pub struct ExecuteWalletVaultTransaction<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub authority: Signer<'info>,
+    /// CHECK: the compressed authority record stores the expected settings key.
+    #[account(mut)]
+    pub squads_settings: UncheckedAccount<'info>,
+    /// CHECK: constrained to the Squads smart account program id.
+    #[account(address = SQUADS_SMART_ACCOUNT_PROGRAM_ID)]
+    pub squads_program: UncheckedAccount<'info>,
+    /// CHECK: PDA signer used as the sole Squads member.
+    #[account(seeds = [VERIFIER_SEED], bump)]
+    pub verifier: UncheckedAccount<'info>,
+}
+
 /// Hot Light-PDA state for the next vault index and rollover float in one Squads pool.
 #[account]
 #[derive(Debug, Default, InitSpace, light_account::LightAccount)]
@@ -645,12 +794,13 @@ pub struct PoolDirectory {
     pub active_pool_index: u128,
 }
 
-/// Per-passkey compressed authority record that stores the vault binding only.
+/// Per-user compressed authority record that stores the vault binding only.
 #[event]
 #[derive(Clone, Debug, Default, LightDiscriminator)]
 pub struct PasskeyAuthority {
     pub version: u8,
     pub status: u8,
+    pub authority_kind: u8,
     pub credential_id_hash: [u8; 32],
     pub passkey_pubkey_prefix: u8,
     pub passkey_pubkey_x: [u8; 32],
@@ -759,6 +909,25 @@ pub fn derive_squads_vault(squads_settings: &Pubkey, vault_index: u8) -> (Pubkey
     )
 }
 
+pub fn wallet_authority_hash(authority: &Pubkey) -> [u8; 32] {
+    hashv(&[WALLET_AUTHORITY_DOMAIN, authority.as_ref()]).to_bytes()
+}
+
+pub fn derive_wallet_authority_address(
+    wallet_authority_hash: &[u8; 32],
+    address_tree: &Pubkey,
+) -> ([u8; 32], AddressSeed) {
+    derive_address(
+        &[
+            PASSKEY_AUTHORITY_SEED,
+            WALLET_AUTHORITY_DOMAIN,
+            wallet_authority_hash.as_ref(),
+        ],
+        address_tree,
+        &crate::ID,
+    )
+}
+
 pub fn compressed_p256_pubkey(prefix: u8, x: &[u8; 32]) -> Result<[u8; 33]> {
     if prefix != 2 && prefix != 3 {
         return err!(PasskeyRegistryError::InvalidPasskeyPublicKey);
@@ -775,11 +944,16 @@ fn validate_current_authority(
     account_meta: &CompressedAccountMeta,
     squads_settings: &Pubkey,
     expected_nonce: u64,
+    expected_authority_kind: u8,
 ) -> Result<()> {
     if authority.version != PASSKEY_AUTHORITY_VERSION
         || authority.status != PASSKEY_AUTHORITY_STATUS_ACTIVE
     {
         return err!(PasskeyRegistryError::InactivePasskeyAuthority);
+    }
+
+    if authority.authority_kind != expected_authority_kind {
+        return err!(PasskeyRegistryError::InvalidAuthorityKind);
     }
 
     if &authority.squads_settings != squads_settings {
@@ -791,20 +965,35 @@ fn validate_current_authority(
     }
 
     let address_tree = Pubkey::new_from_array(ADDRESS_TREE_V2);
-    let (expected_address, _) = derive_address(
-        &[
-            PASSKEY_AUTHORITY_SEED,
-            authority.credential_id_hash.as_ref(),
-        ],
-        &address_tree,
-        &crate::ID,
-    );
+    let expected_address = expected_authority_address(authority, &address_tree)?;
 
     if account_meta.address != expected_address {
         return err!(PasskeyRegistryError::InvalidPasskeyAuthorityAddress);
     }
 
     Ok(())
+}
+
+fn expected_authority_address(
+    authority: &PasskeyAuthority,
+    address_tree: &Pubkey,
+) -> Result<[u8; 32]> {
+    let (expected_address, _) = match authority.authority_kind {
+        AUTHORITY_KIND_PASSKEY => derive_address(
+            &[
+                PASSKEY_AUTHORITY_SEED,
+                authority.credential_id_hash.as_ref(),
+            ],
+            address_tree,
+            &crate::ID,
+        ),
+        AUTHORITY_KIND_WALLET => {
+            derive_wallet_authority_address(&authority.credential_id_hash, address_tree)
+        }
+        _ => return err!(PasskeyRegistryError::InvalidAuthorityKind),
+    };
+
+    Ok(expected_address)
 }
 
 fn validate_active_pool_accounts(
@@ -1397,6 +1586,10 @@ pub enum PasskeyRegistryError {
     InvalidNonce,
     #[msg("The passkey authority nonce overflowed")]
     NonceOverflow,
+    #[msg("The compressed authority kind does not match the instruction")]
+    InvalidAuthorityKind,
+    #[msg("The wallet signer does not own this compressed authority")]
+    UnauthorizedWalletAuthority,
     #[msg("The execution challenge has expired")]
     ExpiredExecutionChallenge,
     #[msg("The remaining accounts split does not match the supplied Light account count")]

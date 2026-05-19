@@ -4,7 +4,7 @@ This repo is Loyal's sandbox for passkey-based Solana onboarding. It currently i
 
 - A Next.js App Router app under `src/app`.
 - A browser PRF tester in `src/features/passkey-prf`.
-- A Solana program in `programs/passkey-registry` for Light Protocol compressed passkey authority records and pooled Squads vault assignment.
+- A Solana program in `programs/passkey-registry` for Light Protocol compressed authority records and pooled Squads vault assignment.
 - Local docs for the program test flow under `docs/`.
 
 ## Commands
@@ -22,7 +22,7 @@ bun run test:sbf
 
 ## Program Notes
 
-The registry stores per-user authority records as Light compressed PDAs, assigns each record a vault index from one shared Squads settings pool, and uses a verifier PDA as the sole Squads signer for synchronous execution.
+The registry stores per-user authority records as Light compressed PDAs, assigns each record a vault index from one shared Squads settings pool, and uses a verifier PDA as the sole Squads signer for synchronous execution. Records can be controlled by either a passkey/WebAuthn flow or a regular Ed25519 wallet signer.
 
 Start with:
 

@@ -12,6 +12,7 @@ export const SECP256R1_PROGRAM_ID = new PublicKey(
 export const LIGHT_ADDRESS_TREE_V2 = new PublicKey("amt2kaJA14v3urZbZvnc5v2np8jqvc4Z8zDep5wbtzx");
 
 export const PASSKEY_AUTHORITY_SEED = "passkey-authority";
+export const WALLET_AUTHORITY_DOMAIN = "LOYAL_WALLET_AUTHORITY_V1";
 export const POOL_ALLOCATOR_SEED = "pool-allocator";
 export const POOL_DIRECTORY_SEED = "pool-directory";
 export const VERIFIER_SEED = "passkey-verifier";
@@ -21,9 +22,11 @@ export const SQUADS_SEED_SMART_ACCOUNT = "smart_account";
 
 export const REGISTRATION_DOMAIN = "LOYAL_PASSKEY_REGISTER_V1";
 export const EXECUTION_DOMAIN = "LOYAL_PASSKEY_EXECUTE_V1";
+export const AUTHORITY_KIND_PASSKEY = 1;
+export const AUTHORITY_KIND_WALLET = 2;
 
 export const SQUADS_EXECUTE_TRANSACTION_SYNC_V2_DISCRIMINATOR = new Uint8Array([
   90, 81, 187, 81, 39, 70, 128, 78,
 ]);
 
-export const PASSKEY_AUTHORITY_DATA_LENGTH = 140;
+export const PASSKEY_AUTHORITY_DATA_LENGTH = 141;

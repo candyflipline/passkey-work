@@ -13,7 +13,7 @@ Run the registry SBF suite with:
 bun run test:sbf
 ```
 
-The suite uses `light-program-test`, starts the Light local environment and prover, loads `programs/passkey-registry`, and runs the compressed PDA registration plus Squads synchronous execution path.
+The suite uses `light-program-test`, starts the Light local environment and prover, loads `programs/passkey-registry`, and runs compressed PDA registration plus Squads synchronous execution for passkey and wallet authority records.
 
 The Squads E2E case also loads the Squads smart-account program. It expects a compiled `squads_smart_account_program.so` in `target/deploy`.
 

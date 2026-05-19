@@ -37,6 +37,15 @@ export type CreatePasskeyAuthorityInstructionArgs = {
   assertion: Pick<PasskeyAssertion, "authenticatorData" | "clientDataJson">;
 };
 
+export type CreateWalletAuthorityInstructionArgs = {
+  authority: PublicKey;
+  poolAllocator: PublicKey;
+  lightRemainingAccounts: AccountMeta[];
+  proof: unknown;
+  addressTreeInfo: unknown;
+  outputStateTreeIndex: number;
+};
+
 export type ExecutePasskeyVaultTransactionInstructionArgs = {
   payer: PublicKey;
   squadsSettings: PublicKey;
@@ -50,6 +59,19 @@ export type ExecutePasskeyVaultTransactionInstructionArgs = {
   currentAuthority: unknown;
   squadsPayload: BytesLike;
   assertion: Pick<PasskeyAssertion, "authenticatorData" | "clientDataJson">;
+};
+
+export type ExecuteWalletVaultTransactionInstructionArgs = {
+  payer: PublicKey;
+  authority: PublicKey;
+  squadsSettings: PublicKey;
+  lightRemainingAccounts: AccountMeta[];
+  squadsInstructionAccounts: AccountMeta[];
+  proof: unknown;
+  accountMeta: unknown;
+  expectedNonce: bigint | number;
+  currentAuthority: unknown;
+  squadsPayload: BytesLike;
 };
 
 export function createSecp256r1Instruction({
@@ -127,6 +149,22 @@ export function createPasskeyAuthorityInstruction(args: CreatePasskeyAuthorityIn
   });
 }
 
+export function createWalletAuthorityInstruction(args: CreateWalletAuthorityInstructionArgs) {
+  return new TransactionInstruction({
+    programId: PASSKEY_REGISTRY_PROGRAM_ID,
+    keys: [
+      { pubkey: args.authority, isSigner: true, isWritable: true },
+      { pubkey: args.poolAllocator, isSigner: false, isWritable: true },
+      ...args.lightRemainingAccounts,
+    ],
+    data: encodeInstruction("create_wallet_authority", {
+      proof: args.proof,
+      addressTreeInfo: args.addressTreeInfo,
+      outputStateTreeIndex: args.outputStateTreeIndex,
+    }),
+  });
+}
+
 export function createExecutePasskeyVaultTransactionInstruction(
   args: ExecutePasskeyVaultTransactionInstructionArgs,
 ) {
@@ -154,6 +192,33 @@ export function createExecutePasskeyVaultTransactionInstruction(
       squadsPayload: Buffer.from(bytes(args.squadsPayload)),
       authenticatorData: Buffer.from(args.assertion.authenticatorData),
       clientDataJson: Buffer.from(args.assertion.clientDataJson),
+    }),
+  });
+}
+
+export function createExecuteWalletVaultTransactionInstruction(
+  args: ExecuteWalletVaultTransactionInstructionArgs,
+) {
+  const [verifier] = deriveVerifierPda();
+
+  return new TransactionInstruction({
+    programId: PASSKEY_REGISTRY_PROGRAM_ID,
+    keys: [
+      { pubkey: args.payer, isSigner: true, isWritable: true },
+      { pubkey: args.authority, isSigner: true, isWritable: false },
+      { pubkey: args.squadsSettings, isSigner: false, isWritable: true },
+      { pubkey: SQUADS_SMART_ACCOUNT_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: verifier, isSigner: false, isWritable: false },
+      ...args.lightRemainingAccounts,
+      ...args.squadsInstructionAccounts,
+    ],
+    data: encodeInstruction("execute_wallet_vault_transaction", {
+      proof: args.proof,
+      accountMeta: args.accountMeta,
+      lightRemainingAccountsCount: args.lightRemainingAccounts.length,
+      expectedNonce: new BN(args.expectedNonce.toString()),
+      currentAuthority: args.currentAuthority,
+      squadsPayload: Buffer.from(bytes(args.squadsPayload)),
     }),
   });
 }
@@ -251,6 +316,29 @@ const passkeyRegistryIdl = {
       ],
     },
     {
+      name: "create_wallet_authority",
+      discriminator: [36, 12, 112, 61, 92, 100, 207, 138],
+      accounts: [],
+      args: [
+        { name: "proof", type: { defined: { name: "ValidityProof" } } },
+        { name: "address_tree_info", type: { defined: { name: "PackedAddressTreeInfo" } } },
+        { name: "output_state_tree_index", type: "u8" },
+      ],
+    },
+    {
+      name: "execute_wallet_vault_transaction",
+      discriminator: [218, 116, 215, 244, 122, 65, 220, 163],
+      accounts: [],
+      args: [
+        { name: "proof", type: { defined: { name: "ValidityProof" } } },
+        { name: "account_meta", type: { defined: { name: "CompressedAccountMeta" } } },
+        { name: "light_remaining_accounts_count", type: "u8" },
+        { name: "expected_nonce", type: "u64" },
+        { name: "current_authority", type: { defined: { name: "PasskeyAuthority" } } },
+        { name: "squads_payload", type: "bytes" },
+      ],
+    },
+    {
       name: "initialize_pool_allocator",
       discriminator: [251, 210, 118, 100, 119, 136, 167, 98],
       accounts: [],
@@ -343,6 +431,7 @@ const passkeyRegistryIdl = {
         fields: [
           { name: "version", type: "u8" },
           { name: "status", type: "u8" },
+          { name: "authority_kind", type: "u8" },
           { name: "credential_id_hash", type: { array: ["u8", 32] } },
           { name: "passkey_pubkey_prefix", type: "u8" },
           { name: "passkey_pubkey_x", type: { array: ["u8", 32] } },

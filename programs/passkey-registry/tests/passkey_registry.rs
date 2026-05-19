@@ -16,10 +16,11 @@ use openssl::{
     nid::Nid,
 };
 use passkey_registry::{
-    build_registration_challenge, compressed_p256_pubkey, PasskeyAuthority, PoolAllocator,
-    PoolDirectory, PASSKEY_AUTHORITY_SEED, POOL_ALLOCATOR_SEED, POOL_ALLOCATOR_STATUS_ACTIVE,
-    POOL_ALLOCATOR_VERSION, POOL_DIRECTORY_SEED, POOL_DIRECTORY_STATUS_ACTIVE,
-    POOL_DIRECTORY_VERSION,
+    build_registration_challenge, compressed_p256_pubkey, derive_wallet_authority_address,
+    wallet_authority_hash, PasskeyAuthority, PoolAllocator, PoolDirectory, AUTHORITY_KIND_PASSKEY,
+    AUTHORITY_KIND_WALLET, PASSKEY_AUTHORITY_SEED, POOL_ALLOCATOR_SEED,
+    POOL_ALLOCATOR_STATUS_ACTIVE, POOL_ALLOCATOR_VERSION, POOL_DIRECTORY_SEED,
+    POOL_DIRECTORY_STATUS_ACTIVE, POOL_DIRECTORY_VERSION,
 };
 use solana_sdk::{
     account::Account,
@@ -165,6 +166,7 @@ async fn creates_passkey_authority_compressed_pda() {
         authority_record.status,
         passkey_registry::PASSKEY_AUTHORITY_STATUS_ACTIVE
     );
+    assert_eq!(authority_record.authority_kind, AUTHORITY_KIND_PASSKEY);
     assert_eq!(authority_record.credential_id_hash, credential_id_hash);
     assert_eq!(
         authority_record.passkey_pubkey_prefix,
@@ -175,6 +177,74 @@ async fn creates_passkey_authority_compressed_pda() {
         passkey_pubkey_compressed[1..]
     );
     assert_eq!(authority_record.ed25519_authority, authority.pubkey());
+    assert_eq!(authority_record.squads_settings, squads_settings);
+    assert_eq!(authority_record.vault_index, 0);
+    assert_eq!(authority_record.nonce, 0);
+
+    let allocator_account = rpc.get_account(pool_allocator).await.unwrap().unwrap();
+    let allocator = PoolAllocator::try_deserialize(&mut allocator_account.data.as_slice()).unwrap();
+    assert_eq!(allocator.squads_settings, squads_settings);
+    assert_eq!(allocator.next_index, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn creates_wallet_authority_compressed_pda() {
+    let _guard = LIGHT_PROGRAM_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    install_light_cli_shim();
+
+    let config = ProgramTestConfig::new_v2(
+        true,
+        Some(vec![
+            ("passkey_registry", passkey_registry::ID),
+            (
+                SQUADS_SMART_ACCOUNT_PROGRAM_NAME,
+                passkey_registry::SQUADS_SMART_ACCOUNT_PROGRAM_ID,
+            ),
+        ]),
+    );
+    let mut rpc = LightProgramTest::new(config).await.unwrap();
+    let payer = rpc.get_payer().insecure_clone();
+    let wallet = Keypair::new();
+    let (verifier, _) = passkey_registry::derive_verifier_pda();
+    let squads_settings = create_squads_smart_account(&mut rpc, &payer, verifier, 1)
+        .await
+        .unwrap();
+    let (pool_allocator, _) = Pubkey::find_program_address(
+        &[POOL_ALLOCATOR_SEED, squads_settings.as_ref()],
+        &passkey_registry::ID,
+    );
+
+    rpc.airdrop_lamports(&wallet.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
+    initialize_pool_allocator(&mut rpc, &payer, pool_allocator, squads_settings)
+        .await
+        .unwrap();
+
+    let address_tree_info = rpc.get_address_tree_v2();
+    let wallet_hash = wallet_authority_hash(&wallet.pubkey());
+    let (address, _) = derive_wallet_authority_address(&wallet_hash, &address_tree_info.tree);
+
+    create_wallet_authority(&mut rpc, &payer, &wallet, pool_allocator, &address)
+        .await
+        .unwrap();
+
+    let authority_record = fetch_passkey_authority(&rpc, address).await;
+    assert_eq!(
+        authority_record.version,
+        passkey_registry::PASSKEY_AUTHORITY_VERSION
+    );
+    assert_eq!(
+        authority_record.status,
+        passkey_registry::PASSKEY_AUTHORITY_STATUS_ACTIVE
+    );
+    assert_eq!(authority_record.authority_kind, AUTHORITY_KIND_WALLET);
+    assert_eq!(authority_record.credential_id_hash, wallet_hash);
+    assert_eq!(authority_record.passkey_pubkey_prefix, 0);
+    assert_eq!(authority_record.passkey_pubkey_x, [0; 32]);
+    assert_eq!(authority_record.ed25519_authority, wallet.pubkey());
     assert_eq!(authority_record.squads_settings, squads_settings);
     assert_eq!(authority_record.vault_index, 0);
     assert_eq!(authority_record.nonce, 0);
@@ -333,36 +403,57 @@ async fn pool_directory_tracks_the_active_squads_pool() {
         rpc.airdrop_lamports(&authority.pubkey(), 1_000_000)
             .await
             .unwrap();
-        let credential_id_hash =
-            hashv(&[b"loyal-test-near-full-pool-credential", &[vault_index]]).to_bytes();
-        let (authority_address, _) = derive_address(
-            &[PASSKEY_AUTHORITY_SEED, credential_id_hash.as_ref()],
-            &address_tree_info.tree,
-            &passkey_registry::ID,
-        );
-        let (passkey_pubkey_compressed, secp256r1_instruction) =
-            create_passkey_signature_instruction(
-                &credential_id_hash,
-                &authority.pubkey(),
+        let (authority_address, expected_kind) = if vault_index % 2 == 0 {
+            let credential_id_hash =
+                hashv(&[b"loyal-test-near-full-pool-credential", &[vault_index]]).to_bytes();
+            let (authority_address, _) = derive_address(
+                &[PASSKEY_AUTHORITY_SEED, credential_id_hash.as_ref()],
                 &address_tree_info.tree,
-                &first_squads_settings,
-                vault_index,
+                &passkey_registry::ID,
             );
+            let (passkey_pubkey_compressed, secp256r1_instruction) =
+                create_passkey_signature_instruction(
+                    &credential_id_hash,
+                    &authority.pubkey(),
+                    &address_tree_info.tree,
+                    &first_squads_settings,
+                    vault_index,
+                );
 
-        create_passkey_authority(
-            &mut rpc,
-            &payer,
-            &authority,
-            first_pool_allocator,
-            &authority_address,
-            secp256r1_instruction,
-            credential_id_hash,
-            passkey_pubkey_compressed,
-        )
-        .await
-        .unwrap();
+            create_passkey_authority(
+                &mut rpc,
+                &payer,
+                &authority,
+                first_pool_allocator,
+                &authority_address,
+                secp256r1_instruction,
+                credential_id_hash,
+                passkey_pubkey_compressed,
+            )
+            .await
+            .unwrap();
+
+            (authority_address, AUTHORITY_KIND_PASSKEY)
+        } else {
+            let wallet_hash = wallet_authority_hash(&authority.pubkey());
+            let (authority_address, _) =
+                derive_wallet_authority_address(&wallet_hash, &address_tree_info.tree);
+
+            create_wallet_authority(
+                &mut rpc,
+                &payer,
+                &authority,
+                first_pool_allocator,
+                &authority_address,
+            )
+            .await
+            .unwrap();
+
+            (authority_address, AUTHORITY_KIND_WALLET)
+        };
 
         let authority_record = fetch_passkey_authority(&rpc, authority_address).await;
+        assert_eq!(authority_record.authority_kind, expected_kind);
         assert_eq!(authority_record.squads_settings, first_squads_settings);
         assert_eq!(authority_record.vault_index, vault_index);
     }
@@ -440,34 +531,22 @@ async fn pool_directory_tracks_the_active_squads_pool() {
     rpc.airdrop_lamports(&authority.pubkey(), 1_000_000_000)
         .await
         .unwrap();
-    let credential_id_hash = hash32(b"loyal-test-post-rollover-credential-id");
-    let (authority_address, _) = derive_address(
-        &[PASSKEY_AUTHORITY_SEED, credential_id_hash.as_ref()],
-        &address_tree_info.tree,
-        &passkey_registry::ID,
-    );
-    let (passkey_pubkey_compressed, secp256r1_instruction) = create_passkey_signature_instruction(
-        &credential_id_hash,
-        &authority.pubkey(),
-        &address_tree_info.tree,
-        &next_squads_settings,
-        0,
-    );
+    let wallet_hash = wallet_authority_hash(&authority.pubkey());
+    let (authority_address, _) =
+        derive_wallet_authority_address(&wallet_hash, &address_tree_info.tree);
 
-    create_passkey_authority(
+    create_wallet_authority(
         &mut rpc,
         &payer,
         &authority,
         next_pool_allocator,
         &authority_address,
-        secp256r1_instruction,
-        credential_id_hash,
-        passkey_pubkey_compressed,
     )
     .await
     .unwrap();
 
     let authority_record = fetch_passkey_authority(&rpc, authority_address).await;
+    assert_eq!(authority_record.authority_kind, AUTHORITY_KIND_WALLET);
     assert_eq!(authority_record.squads_settings, next_squads_settings);
     assert_eq!(authority_record.vault_index, 0);
 
@@ -711,6 +790,160 @@ async fn passkey_verifier_executes_squads_vault_transfer() {
     assert_eq!(authority_record.vault_index, 0);
     assert_eq!(authority_record.squads_settings, squads_settings);
     assert_eq!(authority_record.nonce, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wallet_verifier_executes_squads_vault_transfer() {
+    let _guard = LIGHT_PROGRAM_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    install_light_cli_shim();
+
+    let config = ProgramTestConfig::new_v2(
+        true,
+        Some(vec![
+            ("passkey_registry", passkey_registry::ID),
+            (
+                SQUADS_SMART_ACCOUNT_PROGRAM_NAME,
+                passkey_registry::SQUADS_SMART_ACCOUNT_PROGRAM_ID,
+            ),
+        ]),
+    );
+    let mut rpc = LightProgramTest::new(config).await.unwrap();
+    let payer = rpc.get_payer().insecure_clone();
+    let wallet = Keypair::new();
+    let recipient = Keypair::new();
+    let (verifier, _) = passkey_registry::derive_verifier_pda();
+
+    let squads_settings = create_squads_smart_account(&mut rpc, &payer, verifier, 1)
+        .await
+        .unwrap();
+    let (pool_allocator, _) = Pubkey::find_program_address(
+        &[POOL_ALLOCATOR_SEED, squads_settings.as_ref()],
+        &passkey_registry::ID,
+    );
+
+    initialize_pool_allocator(&mut rpc, &payer, pool_allocator, squads_settings)
+        .await
+        .unwrap();
+    rpc.airdrop_lamports(&wallet.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
+
+    let address_tree_info = rpc.get_address_tree_v2();
+    let wallet_hash = wallet_authority_hash(&wallet.pubkey());
+    let (address, _) = derive_wallet_authority_address(&wallet_hash, &address_tree_info.tree);
+    create_wallet_authority(&mut rpc, &payer, &wallet, pool_allocator, &address)
+        .await
+        .unwrap();
+
+    let (vault_0, _) = passkey_registry::derive_squads_vault(&squads_settings, 0);
+    let transfer_to_vault_lamports = 20_000_000;
+    let transfer_back_lamports = 7_000_000;
+    rpc.create_and_send_transaction(
+        &[system_instruction::transfer(
+            &payer.pubkey(),
+            &vault_0,
+            transfer_to_vault_lamports,
+        )],
+        &payer.pubkey(),
+        &[&payer],
+    )
+    .await
+    .unwrap();
+
+    let recipient_start_balance = get_balance_or_zero(&rpc, recipient.pubkey()).await;
+    let vault_start_balance = get_balance_or_zero(&rpc, vault_0).await;
+    execute_wallet_vault_transfer(
+        &mut rpc,
+        &payer,
+        &wallet,
+        &address,
+        recipient.pubkey(),
+        transfer_back_lamports,
+    )
+    .await
+    .unwrap();
+
+    let recipient_end_balance = get_balance_or_zero(&rpc, recipient.pubkey()).await;
+    let vault_end_balance = get_balance_or_zero(&rpc, vault_0).await;
+    assert_eq!(
+        recipient_end_balance - recipient_start_balance,
+        transfer_back_lamports
+    );
+    assert_eq!(
+        vault_start_balance - vault_end_balance,
+        transfer_back_lamports
+    );
+
+    let authority_record = fetch_passkey_authority(&rpc, address).await;
+    assert_eq!(authority_record.authority_kind, AUTHORITY_KIND_WALLET);
+    assert_eq!(authority_record.vault_index, 0);
+    assert_eq!(authority_record.squads_settings, squads_settings);
+    assert_eq!(authority_record.nonce, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rejects_wallet_execution_from_wrong_signer() {
+    let _guard = LIGHT_PROGRAM_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    install_light_cli_shim();
+
+    let config = ProgramTestConfig::new_v2(
+        true,
+        Some(vec![
+            ("passkey_registry", passkey_registry::ID),
+            (
+                SQUADS_SMART_ACCOUNT_PROGRAM_NAME,
+                passkey_registry::SQUADS_SMART_ACCOUNT_PROGRAM_ID,
+            ),
+        ]),
+    );
+    let mut rpc = LightProgramTest::new(config).await.unwrap();
+    let payer = rpc.get_payer().insecure_clone();
+    let wallet = Keypair::new();
+    let wrong_wallet = Keypair::new();
+    let recipient = Keypair::new();
+    let (verifier, _) = passkey_registry::derive_verifier_pda();
+
+    let squads_settings = create_squads_smart_account(&mut rpc, &payer, verifier, 1)
+        .await
+        .unwrap();
+    let (pool_allocator, _) = Pubkey::find_program_address(
+        &[POOL_ALLOCATOR_SEED, squads_settings.as_ref()],
+        &passkey_registry::ID,
+    );
+    initialize_pool_allocator(&mut rpc, &payer, pool_allocator, squads_settings)
+        .await
+        .unwrap();
+    rpc.airdrop_lamports(&wallet.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
+    rpc.airdrop_lamports(&wrong_wallet.pubkey(), 1_000_000_000)
+        .await
+        .unwrap();
+
+    let address_tree_info = rpc.get_address_tree_v2();
+    let wallet_hash = wallet_authority_hash(&wallet.pubkey());
+    let (address, _) = derive_wallet_authority_address(&wallet_hash, &address_tree_info.tree);
+    create_wallet_authority(&mut rpc, &payer, &wallet, pool_allocator, &address)
+        .await
+        .unwrap();
+
+    assert!(execute_wallet_vault_transfer(
+        &mut rpc,
+        &payer,
+        &wrong_wallet,
+        &address,
+        recipient.pubkey(),
+        1_000_000,
+    )
+    .await
+    .is_err());
+
+    let authority_record = fetch_passkey_authority(&rpc, address).await;
+    assert_eq!(authority_record.nonce, 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1255,6 +1488,57 @@ async fn create_passkey_authority_with_instruction_order(
         .await
 }
 
+async fn create_wallet_authority(
+    rpc: &mut LightProgramTest,
+    payer: &Keypair,
+    authority: &Keypair,
+    pool_allocator: Pubkey,
+    address: &[u8; 32],
+) -> Result<Signature, RpcError> {
+    let mut remaining_accounts = PackedAccounts::default();
+    remaining_accounts
+        .add_system_accounts_v2(SystemAccountMetaConfig::new(passkey_registry::ID))?;
+
+    let address_tree_info = rpc.get_address_tree_v2();
+    let proof_result = rpc
+        .get_validity_proof(
+            vec![],
+            vec![AddressWithTree {
+                address: *address,
+                tree: address_tree_info.tree,
+            }],
+            None,
+        )
+        .await?
+        .value;
+    let packed_accounts = proof_result.pack_tree_infos(&mut remaining_accounts);
+    let output_state_tree_index = rpc
+        .get_random_state_tree_info()?
+        .pack_output_tree_index(&mut remaining_accounts)?;
+    let (remaining_account_metas, _, _) = remaining_accounts.to_account_metas();
+
+    let instruction = Instruction {
+        program_id: passkey_registry::ID,
+        accounts: [
+            vec![
+                AccountMeta::new(authority.pubkey(), true),
+                AccountMeta::new(pool_allocator, false),
+            ],
+            remaining_account_metas,
+        ]
+        .concat(),
+        data: passkey_registry::instruction::CreateWalletAuthority {
+            proof: proof_result.proof,
+            address_tree_info: packed_accounts.address_trees[0],
+            output_state_tree_index,
+        }
+        .data(),
+    };
+
+    rpc.create_and_send_transaction(&[instruction], &payer.pubkey(), &[payer, authority])
+        .await
+}
+
 fn create_passkey_signature_instruction(
     credential_id_hash: &[u8; 32],
     authority: &solana_sdk::pubkey::Pubkey,
@@ -1478,6 +1762,87 @@ async fn execute_passkey_vault_transfer(
         &[payer],
     )
     .await
+}
+
+async fn execute_wallet_vault_transfer(
+    rpc: &mut LightProgramTest,
+    payer: &Keypair,
+    authority: &Keypair,
+    address: &[u8; 32],
+    recipient: Pubkey,
+    lamports: u64,
+) -> Result<Signature, RpcError> {
+    let compressed_account = rpc
+        .get_compressed_account(*address, None)
+        .await?
+        .value
+        .ok_or_else(|| RpcError::CustomError("missing compressed authority".to_string()))?;
+    let current_authority = PasskeyAuthority::deserialize(
+        &mut &compressed_account
+            .data
+            .as_ref()
+            .ok_or_else(|| RpcError::CustomError("missing compressed authority data".to_string()))?
+            .data[..],
+    )
+    .map_err(|error| RpcError::CustomError(format!("deserialize authority failed: {error}")))?;
+
+    let (vault, _) = passkey_registry::derive_squads_vault(
+        &current_authority.squads_settings,
+        current_authority.vault_index,
+    );
+    let squads_payload = squads_system_transfer_payload(lamports);
+    let squads_instruction_metas = vec![
+        AccountMeta::new(vault, false),
+        AccountMeta::new(recipient, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ];
+
+    let mut remaining_accounts = PackedAccounts::default();
+    remaining_accounts
+        .add_system_accounts_v2(SystemAccountMetaConfig::new(passkey_registry::ID))?;
+    let proof_result = rpc
+        .get_validity_proof(vec![compressed_account.hash], vec![], None)
+        .await?
+        .value;
+    let packed_accounts = proof_result.pack_tree_infos(&mut remaining_accounts);
+    let state_trees = packed_accounts
+        .state_trees
+        .ok_or_else(|| RpcError::CustomError("missing state tree proof".to_string()))?;
+    let account_meta = CompressedAccountMeta {
+        tree_info: state_trees.packed_tree_infos[0],
+        address: *address,
+        output_state_tree_index: state_trees.output_tree_index,
+    };
+    let (light_remaining_account_metas, _, _) = remaining_accounts.to_account_metas();
+    let light_remaining_accounts_count = light_remaining_account_metas.len() as u8;
+
+    let execute_instruction = Instruction {
+        program_id: passkey_registry::ID,
+        accounts: [
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(authority.pubkey(), true),
+                AccountMeta::new(current_authority.squads_settings, false),
+                AccountMeta::new_readonly(passkey_registry::SQUADS_SMART_ACCOUNT_PROGRAM_ID, false),
+                AccountMeta::new_readonly(passkey_registry::derive_verifier_pda().0, false),
+            ],
+            light_remaining_account_metas,
+            squads_instruction_metas,
+        ]
+        .concat(),
+        data: passkey_registry::instruction::ExecuteWalletVaultTransaction {
+            proof: proof_result.proof,
+            account_meta,
+            light_remaining_accounts_count,
+            expected_nonce: current_authority.nonce,
+            current_authority,
+            squads_payload,
+        }
+        .data(),
+    };
+
+    rpc.create_and_send_transaction(&[execute_instruction], &payer.pubkey(), &[payer, authority])
+        .await
 }
 
 fn squads_system_transfer_payload(lamports: u64) -> Vec<u8> {

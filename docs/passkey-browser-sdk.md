@@ -1,6 +1,6 @@
 # Passkey Browser SDK
 
-The browser SDK lives in `src/features/passkey-smart-account`. It packages the pieces the web app needs to integrate with the passkey registry and pooled Squads vault flow: WebAuthn passkey creation, P-256 public-key extraction, PRF evaluation for the Ed25519 Solana authority seed, registration and execution challenge builders, PDA derivation, `secp256r1` precompile instruction packing, registry instruction packing, and immutable transaction-plan helpers for user-paid or backend-sponsored transactions.
+The browser SDK lives in `src/features/passkey-smart-account`. It packages the pieces the web app needs to integrate with the registry and pooled Squads vault flow: WebAuthn passkey creation, P-256 public-key extraction, PRF evaluation for the Ed25519 Solana authority seed, registration and execution challenge builders, PDA derivation, `secp256r1` precompile instruction packing, registry instruction packing, wallet-authority instruction packing, and immutable transaction-plan helpers for user-paid or backend-sponsored transactions.
 
 ## Data Flow
 
@@ -10,7 +10,9 @@ Registration is a three-step browser flow:
 2. `derivePrfAuthority` asks the same credential to evaluate the PRF salt and turns the 32-byte PRF output into a Solana `Keypair.fromSeed` authority. This authority signs registration as the Solana signer.
 3. After the app has the active pool data from Solana, `buildRegistrationChallenge` constructs the exact challenge that the program expects. `getPasskeyAssertion` signs it through WebAuthn, and `createPasskeySecp256r1Instruction` packs the assertion into the Solana P-256 precompile instruction.
 
-The registry stores the credential hash, compressed P-256 key, PRF-derived Ed25519 authority, Squads settings address, vault index, and nonce in the compressed `PasskeyAuthority` record. The vault address is then derived from `squads_settings` plus `vault_index`; it is not derivable from the P-256 key alone unless the matching authority record has already been fetched and decoded. Use `deriveSmartAccountAddressesForPasskeyPublicKey` when the browser has both the P-256 key and decoded record.
+The registry stores `authorityKind`, the credential or wallet authority hash, compressed P-256 key fields, Ed25519 authority, Squads settings address, vault index, and nonce in the compressed `PasskeyAuthority` record. The vault address is then derived from `squads_settings` plus `vault_index`; it is not derivable from the P-256 key or wallet pubkey alone unless the matching authority record has already been fetched and decoded. Use `deriveSmartAccountAddressesForPasskeyPublicKey` when the browser has both the P-256 key and decoded passkey record.
+
+Regular wallet records use `walletAuthorityHash(authority)` and `deriveWalletAuthorityAddress(...)`, then pack `createWalletAuthorityInstruction` with the same Light proof and allocator accounts used by passkey registration. Wallet execution uses `createExecuteWalletVaultTransactionInstruction`; the wallet authority signs the Solana transaction and no `secp256r1` instruction is included.
 
 Execution uses the same WebAuthn assertion shape. `buildExecutionChallenge` binds the stored authority record, nonce, expiry, Squads payload hash, and forwarded Squads account metas. The registry verifies the `secp256r1` instruction against `authenticatorData || sha256(clientDataJSON)`, checks that `clientDataJSON.challenge` equals the expected challenge, bumps the compressed nonce, and CPIs into Squads synchronous execution.
 

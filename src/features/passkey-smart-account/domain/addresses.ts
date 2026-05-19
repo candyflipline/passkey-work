@@ -12,8 +12,17 @@ import {
   SQUADS_SEED_SMART_ACCOUNT,
   SQUADS_SMART_ACCOUNT_PROGRAM_ID,
   VERIFIER_SEED,
+  WALLET_AUTHORITY_DOMAIN,
 } from "./constants";
-import { fixedBytes, littleEndianU128, readU64Le, utf8, type BytesLike } from "./bytes";
+import {
+  fixedBytes,
+  hashv,
+  littleEndianU128,
+  publicKeyBytes,
+  readU64Le,
+  utf8,
+  type BytesLike,
+} from "./bytes";
 
 export type CompressedP256PublicKey = {
   prefix: number;
@@ -23,6 +32,7 @@ export type CompressedP256PublicKey = {
 export type PasskeyAuthorityRecord = {
   version: number;
   status: number;
+  authorityKind: number;
   credentialIdHash: Uint8Array;
   passkeyPublicKey: CompressedP256PublicKey;
   ed25519Authority: PublicKey;
@@ -75,6 +85,26 @@ export function derivePasskeyAuthorityAddress(
   return deriveAddress(seed, new PublicKey(addressTree), PASSKEY_REGISTRY_PROGRAM_ID);
 }
 
+export function deriveWalletAuthorityAddress(
+  walletAuthorityHash: BytesLike,
+  addressTree: PublicKey | string = LIGHT_ADDRESS_TREE_V2,
+) {
+  const seed = deriveAddressSeed(
+    [
+      utf8(PASSKEY_AUTHORITY_SEED),
+      utf8(WALLET_AUTHORITY_DOMAIN),
+      fixedBytes(walletAuthorityHash, 32, "walletAuthorityHash"),
+    ],
+    PASSKEY_REGISTRY_PROGRAM_ID,
+  );
+
+  return deriveAddress(seed, new PublicKey(addressTree), PASSKEY_REGISTRY_PROGRAM_ID);
+}
+
+export async function walletAuthorityHash(authority: PublicKey | string) {
+  return hashv([utf8(WALLET_AUTHORITY_DOMAIN), publicKeyBytes(authority)]);
+}
+
 export function derivePoolDirectoryAddress(addressTree: PublicKey | string = LIGHT_ADDRESS_TREE_V2) {
   const seed = deriveAddressSeed([utf8(POOL_DIRECTORY_SEED)], PASSKEY_REGISTRY_PROGRAM_ID);
 
@@ -88,6 +118,9 @@ export function decodePasskeyAuthorityRecord(data: BytesLike): PasskeyAuthorityR
 
   offset += 1;
   const status = input[offset];
+
+  offset += 1;
+  const authorityKind = input[offset];
 
   offset += 1;
   const credentialIdHash = input.slice(offset, offset + 32);
@@ -113,6 +146,7 @@ export function decodePasskeyAuthorityRecord(data: BytesLike): PasskeyAuthorityR
   return {
     version,
     status,
+    authorityKind,
     credentialIdHash,
     passkeyPublicKey: { prefix, x },
     ed25519Authority,
